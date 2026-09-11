@@ -60,6 +60,44 @@ test('at a full table the solution goes to the preceding player only', () => {
   }
 });
 
+test('la passe de lecture déplace la solution vers le lecteur suivant, écran par écran', () => {
+  // Le lecteur naturel de c (actif) est b. Quand b rend la lecture
+  // (`declinesReading`), c'est a qui lit : la solution doit le suivre — et ne
+  // rester ni chez b (qui a passé), ni chez le joueur actif, ni chez le
+  // spectateur d.
+  const state = createGameState({
+    players: [createPlayer('a', true), createPlayer('b'), createPlayer('c'), createPlayer('d')],
+    activePlayerIndex: 2,
+  });
+  state.settings = { ...state.settings, isReaderMode: true };
+  state.players[1].declinesReading = true;
+
+  assert.equal(createGameStateView(state, 'a', 'a').currentQuestion?.correctAnswerIndex, 1);
+  for (const otherId of ['b', 'c', 'd']) {
+    assert.equal(
+      createGameStateView(state, otherId, 'a').currentQuestion?.correctAnswerIndex,
+      undefined,
+      `la solution ne doit pas partir vers ${otherId}`,
+    );
+  }
+
+  // b reprend la lecture : la solution lui revient, et quitte a.
+  state.players[1].declinesReading = false;
+  assert.equal(createGameStateView(state, 'b', 'a').currentQuestion?.correctAnswerIndex, 1);
+  assert.equal(createGameStateView(state, 'a', 'a').currentQuestion?.correctAnswerIndex, undefined);
+});
+
+test('si tous les autres rendent la lecture, personne ne reçoit la solution', () => {
+  // Jamais de repli vers le joueur actif : sans lecteur possible, la carte
+  // s'affiche (côté client) mais la solution reste sur le serveur.
+  const state = createGameState();
+  state.settings = { ...state.settings, isReaderMode: true };
+  state.players[1].declinesReading = true;
+
+  assert.equal(createGameStateView(state, 'host', 'host').currentQuestion?.correctAnswerIndex, undefined);
+  assert.equal(createGameStateView(state, 'reader', 'host').currentQuestion?.correctAnswerIndex, undefined);
+});
+
 test('the live duo hands the solution to the reader without reader mode set', () => {
   const state = createGameState({
     players: [createPlayer('a', true), createPlayer('b'), createPlayer('c')],

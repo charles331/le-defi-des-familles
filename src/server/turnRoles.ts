@@ -39,6 +39,17 @@ export function isCardReadAloud(
 export interface TurnRolePlayer {
   id: string;
   isConnected: boolean;
+  /**
+   * Ce joueur a rendu la lecture : il ne lit pas les cartes à voix haute.
+   *
+   * Même effet qu'une déconnexion sur la résolution du lecteur — on passe au
+   * joueur connecté précédent — mais l'état vient d'un choix : quelqu'un qui ne
+   * sait pas bien lire, ou ne veut pas parler, passe la main une fois et n'est
+   * plus jamais désigné, jusqu'à ce qu'il reprenne la lecture. Le drapeau vit
+   * sur le joueur (état serveur, persisté avec lui) pour que chaque écran
+   * dérive le même lecteur, tour après tour et reprise du disque comprise.
+   */
+  declinesReading?: boolean;
 }
 
 export type LiveRole = 'answerer' | 'reader' | 'spectator';
@@ -49,6 +60,13 @@ export type LiveRole = 'answerer' | 'reader' | 'spectator';
  * Walks backwards from the active player and skips disconnected players: with a
  * masked card, a reader who dropped out of the game would leave the answerer
  * staring at four blank options with nobody able to read them.
+ *
+ * Les joueurs qui ont rendu la lecture (`declinesReading`) sont sautés de la
+ * même manière : le lecteur est toujours *résolu* — jamais stocké — si bien que
+ * la solution, les rôles à l'antenne et l'affichage suivent le même joueur sur
+ * tous les écrans, y compris quand la main vient de passer en pleine question.
+ * S'il ne reste personne pour lire, on rend `null` et la carte s'affiche au
+ * joueur actif, comme hors mode lecteur (le repli existant).
  */
 export function resolveReaderIndex(
   players: readonly TurnRolePlayer[],
@@ -61,7 +79,7 @@ export function resolveReaderIndex(
   for (let step = 1; step < count; step += 1) {
     const index = ((activePlayerIndex - step) % count + count) % count;
     const candidate = players[index];
-    if (candidate && candidate.isConnected) return index;
+    if (candidate && candidate.isConnected && candidate.declinesReading !== true) return index;
   }
 
   return null;

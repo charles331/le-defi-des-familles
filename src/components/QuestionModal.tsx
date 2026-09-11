@@ -34,6 +34,12 @@ interface QuestionModalProps {
   onSubmitAnswer: (optionIndex: number) => void;
   onUseBonus: (bonusType: BonusType) => void;
   onNextTurn: () => void;
+  /**
+   * Rendre ou reprendre la lecture (mode lecteur). Le serveur pose
+   * `declinesReading` sur le joueur visé et chaque écran re-dérive le lecteur :
+   * rien n'est décidé ici.
+   */
+  onSetReadingPreference?: (playerId: string, declinesReading: boolean) => void;
   /** Le joueur actif signale la fin de la roue surprise pour lancer le minuteur. */
   onSurpriseWheelDone?: () => void;
   /** Le joueur actif lance la roue ; le serveur en retient l'instant pour tous. */
@@ -62,6 +68,7 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
   onSubmitAnswer,
   onUseBonus,
   onNextTurn,
+  onSetReadingPreference,
   onSurpriseWheelDone,
   onSpinSurpriseWheel,
   wedgesToWin = 6,
@@ -106,6 +113,7 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
   const activeIndex = allPlayers.findIndex(p => p.id === activePlayer.id);
   const readerId = activeIndex >= 0 ? resolveReaderId(allPlayers, activeIndex) : null;
   const readerPlayer = allPlayers.find(p => p.id === readerId) ?? activePlayer;
+  const me = allPlayers.find(p => p.id === currentUserId) ?? null;
 
   // Determine if current client is the designated Reader (MUST be a non-active player when Reader Mode is ENABLED).
   // The match is exact: a spectator who wrongly believed they were the reader
@@ -413,6 +421,22 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
             >
               Je suis {readerPlayer.name}, afficher la carte
             </button>
+            {/* La passe de lecture existe aussi en pass & play : le serveur pose
+                `declinesReading` sur le lecteur nommé, et l'écran-porte se
+                renomme vers le suivant. S'il ne reste personne pour lire, la
+                porte se ferme et la carte s'affiche, comme hors mode lecteur. */}
+            {onSetReadingPreference && (
+              <button
+                type="button"
+                onClick={() => {
+                  soundManager.playClick();
+                  onSetReadingPreference(readerPlayer.id, true);
+                }}
+                className="tap-target w-full rounded-2xl border border-slate-600 py-2.5 text-xs font-bold text-slate-300 hover:bg-slate-800"
+              >
+                {readerPlayer.name} ne peut pas lire ? Passer la lecture
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -473,18 +497,56 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
           <div className="flex shrink-0 items-center gap-1.5 border-b border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-[11px] font-bold leading-snug text-amber-900 dark:text-amber-200">
             <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-500" />
             {isIActivePlayer ? (
-              <span className="min-w-0">
+              <span className="min-w-0 flex-1">
                 <strong>{readerPlayer.name}</strong> vous lit la carte à voix haute.
               </span>
             ) : isIReader ? (
-              <span className="min-w-0">
+              <span className="min-w-0 flex-1">
                 <strong>Vous lisez</strong> la question et les options à <strong>{activePlayer.name}</strong>.
               </span>
             ) : (
-              <span className="min-w-0">
+              <span className="min-w-0 flex-1">
                 <strong>{readerPlayer.name}</strong> lit la carte à <strong>{activePlayer.name}</strong>.
               </span>
             )}
+            {/* Passer la lecture : le lecteur rend la main (il ne sait pas bien
+                lire, ou ne veut pas parler), ou l'organisateur la retire à un
+                lecteur en difficulté. Le serveur pose `declinesReading` et le
+                lecteur suivant est re-résolu partout : solution, antenne et
+                bandeau suivent d'un même mouvement, et le décompte repart.
+                En local, la passe vit sur l'écran « passez l'appareil ». */}
+            {onSetReadingPreference && !isLocalMode && (isIReader || me?.isHost === true) && (
+              <button
+                type="button"
+                onClick={() => {
+                  soundManager.playClick();
+                  onSetReadingPreference(readerPlayer.id, true);
+                }}
+                className="tap-target shrink-0 rounded-lg border border-amber-500/60 bg-white px-2 py-1 text-[10px] font-black uppercase tracking-wide text-amber-800 hover:bg-amber-100 dark:bg-slate-800 dark:text-amber-200 dark:hover:bg-slate-700"
+              >
+                {isIReader ? 'Passer la lecture' : 'Changer de lecteur'}
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Celui qui a rendu la lecture peut la reprendre à tout moment : sans ce
+            rappel, le drapeau ne se lèverait plus jamais — il n'est le lecteur de
+            personne et ne verrait donc plus aucun bouton. */}
+        {isReaderMode && !isLocalMode && !isAnswered && !isIActivePlayer
+          && me?.declinesReading === true && onSetReadingPreference && (
+          <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-300/60 bg-slate-100 px-3 py-1 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300">
+            <span className="min-w-0">Vous ne lisez plus les cartes à voix haute.</span>
+            <button
+              type="button"
+              onClick={() => {
+                soundManager.playClick();
+                onSetReadingPreference(me.id, false);
+              }}
+              className="tap-target shrink-0 rounded-lg border border-slate-400/60 px-2 py-0.5 font-black uppercase tracking-wide hover:bg-white dark:hover:bg-slate-700"
+            >
+              Relire les cartes
+            </button>
           </div>
         )}
 

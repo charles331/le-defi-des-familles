@@ -9,10 +9,11 @@ import {
 } from '../src/server/turnRoles';
 import { testSettings } from './fixtures';
 
-const table = (count: number, disconnected: string[] = []) =>
+const table = (count: number, disconnected: string[] = [], declining: string[] = []) =>
   Array.from({ length: count }, (_, index) => ({
     id: `p${index}`,
     isConnected: !disconnected.includes(`p${index}`),
+    declinesReading: declining.includes(`p${index}`),
   }));
 
 test('the reader is the player seated just before the one being questioned', () => {
@@ -40,6 +41,31 @@ test('nobody reads when no other player is connected', () => {
 test('the two players on air are the answerer and their reader', () => {
   assert.deepEqual(resolveOnAirIds(table(4), 2), ['p2', 'p1']);
   assert.deepEqual(resolveOnAirIds(table(1), 0), ['p0']);
+});
+
+test('un joueur qui a rendu la lecture est sauté comme un déconnecté', () => {
+  // La passe de lecture : quelqu'un qui ne sait pas bien lire, ou ne veut pas
+  // parler, pose `declinesReading` et la résolution passe au joueur connecté
+  // précédent — même mécanique que pour une déconnexion, mais choisie.
+  assert.equal(resolveReaderId(table(4, [], ['p3']), 0), 'p2');
+  assert.equal(resolveReaderId(table(4, [], ['p3', 'p2']), 0), 'p1');
+  // Déconnexion et passe se combinent sans se gêner.
+  assert.equal(resolveReaderId(table(4, ['p2'], ['p3']), 0), 'p1');
+});
+
+test('la passe de lecture ne peut jamais désigner le joueur actif', () => {
+  // Tous les autres ont rendu la lecture : la résolution rend `null` (la carte
+  // s'affiche alors au joueur actif, repli existant), jamais le joueur actif
+  // lui-même — il ne doit jamais recevoir la solution.
+  assert.equal(resolveReaderId(table(3, [], ['p0', 'p1']), 2), null);
+  // Sa propre passe ne pèse pas sur son propre tour : il n'est jamais candidat.
+  assert.equal(resolveReaderId(table(3, [], ['p0']), 0), 'p2');
+});
+
+test('l’antenne suit le lecteur de remplacement', () => {
+  // Caméra et micro s'ouvrent pour le duo répondeur/lecteur : quand la lecture
+  // passe, le micro doit passer avec elle, sur tous les écrans.
+  assert.deepEqual(resolveOnAirIds(table(4, [], ['p1']), 2), ['p2', 'p0']);
 });
 
 test('every other player is a spectator', () => {

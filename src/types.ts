@@ -89,6 +89,17 @@ export interface Player {
   isConnected: boolean;
   /** Bonus gagnés et conservés jusqu'à ce que le joueur décide de les utiliser. */
   bonuses?: PlayerBonuses;
+  /**
+   * Ce joueur ne lit pas les cartes à voix haute (mode lecteur).
+   *
+   * Posé quand il passe la lecture — parce qu'il ne sait pas bien lire, ou ne
+   * veut pas parler — et levé quand il la reprend. La résolution du lecteur le
+   * saute comme elle saute un déconnecté : le rôle, la solution et l'antenne
+   * suivent alors le joueur connecté précédent, sur tous les écrans à la fois.
+   * Le drapeau vit sur le joueur : il survit au changement de tour, aux manches
+   * et à la reprise du disque, sans être recopié nulle part.
+   */
+  declinesReading?: boolean;
 }
 
 export type BoardType = 'wheel' | 'snake' | 'star';

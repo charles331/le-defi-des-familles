@@ -1129,6 +1129,59 @@ io.on('connection', (socket: Socket) => {
   }
 
   /**
+   * Un joueur rend la lecture, ou la reprend.
+   *
+   * En mode lecteur, le lecteur désigné est résolu — le joueur connecté
+   * précédent — et rien ne permettait de passer la main : quelqu'un qui ne sait
+   * pas bien lire, ou ne veut pas parler, restait seul détenteur de la solution.
+   * Mesuré en partie à trois clients : le seul « passage » possible était de
+   * fermer l'application, et la lecture lui revenait de force dès sa
+   * reconnexion, en pleine question.
+   *
+   * Le passage est un état serveur porté par le joueur (`declinesReading`), que
+   * chaque écran dérive via `resolveReaderId` : la solution, le duo à l'antenne
+   * et le bandeau suivent le nouveau lecteur d'un même mouvement, et l'état
+   * survit au changement de tour comme à la reprise du disque. On ne désigne
+   * jamais une cible : le remplaçant est résolu, donc le joueur actif ne peut
+   * être nommé lecteur par personne — la résolution ne le rend jamais.
+   *
+   * Qui peut déclencher : le joueur pour lui-même, ou l'organisateur pour
+   * n'importe qui — le cas de l'enfant perdu devant une carte qu'il ne sait pas
+   * lire, et les sièges du pass & play, qui n'ont pas de socket.
+   */
+  socket.on('set-reading-preference', (data: { roomCode: string; playerId?: string; declinesReading?: boolean }) => {
+    const room = getRoom(data.roomCode);
+    if (!room || isPaused(room)) return;
+    if (typeof data.declinesReading !== 'boolean') return;
+
+    const targetId = data.playerId ?? socket.id;
+    const target = room.gameState.players.find(player => player.id === targetId);
+    if (!target) return;
+    if (targetId !== socket.id && room.hostSocketId !== socket.id) return;
+    if (target.declinesReading === data.declinesReading) return;
+
+    const readerBefore = resolveReaderId(room.gameState.players, room.gameState.activePlayerIndex);
+    target.declinesReading = data.declinesReading;
+    const readerAfter = resolveReaderId(room.gameState.players, room.gameState.activePlayerIndex);
+
+    // La main passe en pleine question : le décompte repart de zéro, le temps
+    // que le nouveau lecteur reprenne la carte du début — sans cela, le joueur
+    // interrogé paierait la passe en secondes. Un minuteur qui attendait encore
+    // (roue surprise) continue d'attendre : on ne le démarre pas ici.
+    if (
+      room.gameState.phase === 'question'
+      && isCardReadAloud(room.settings)
+      && readerBefore !== readerAfter
+      && room.gameState.questionStartTime != null
+    ) {
+      room.gameState.questionStartTime = Date.now();
+    }
+
+    emitGameState(room);
+    saveRooms(rooms);
+  });
+
+  /**
    * Bascule la pause. Réservée à l'organisateur.
    *
    * À la reprise, `questionStartTime` est décalé de la durée de la pause : le

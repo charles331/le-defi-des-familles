@@ -91,6 +91,23 @@ test('hors mode lecteur, aucune carte ouverte ne sort — et le reste tient sa p
   assert.ok(compte.boolean > 0, 'les vrai/faux ne dépendent pas du mode lecteur');
 });
 
+test('une carte ouverte n’est pas servie si le seul lecteur possible a rendu la lecture', () => {
+  // La passe de lecture (`declinesReading`) compte comme une absence pour le
+  // tirage : une carte ouverte servie sans personne pour la juger ne pourrait
+  // qu'être passée, comptée manquée — même filet que pour les déconnectés.
+  const passeur = { ...joueur('b'), declinesReading: true };
+  const sansLecteur = formatsServis(
+    etat([joueur('a'), passeur], { isReaderMode: true }), 'adulte',
+  );
+  assert.equal(sansLecteur.open, 0, 'aucune carte ouverte quand l’unique lecteur a passé la main');
+
+  // Avec un troisième joueur qui lit encore, elles reviennent.
+  const table = formatsServis(
+    etat([joueur('a'), passeur, joueur('c')], { isReaderMode: true }), 'adulte',
+  );
+  assert.ok(table.open > 0, 'les cartes ouvertes sortent tant qu’il reste un lecteur');
+});
+
 test('le niveau et la catégorie demandés sont toujours respectés', () => {
   // Plutôt resservir une carte déjà vue que poser une question adulte à un enfant.
   const state = etat([joueur('a'), joueur('b')], { isReaderMode: true });

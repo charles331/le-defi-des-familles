@@ -298,6 +298,17 @@ export default function App() {
     }
   };
 
+  /**
+   * Rendre ou reprendre la lecture (mode lecteur). L'écran n'envoie qu'un
+   * souhait : c'est le serveur qui pose `declinesReading` sur le joueur et
+   * re-résout le lecteur pour tous — solution, antenne et bandeau suivent.
+   */
+  const handleSetReadingPreference = (playerId: string, declinesReading: boolean) => {
+    if (socket && gameState) {
+      socket.emit('set-reading-preference', { roomCode: gameState.roomCode, playerId, declinesReading });
+    }
+  };
+
   // Revenir au salon n'est pas quitter : la table reste, les réglages restent, et
   // l'organisateur peut relancer. Le bouton pointait sur `leave-room`, qui fermait
   // le salon pour tout le monde quand c'était l'organisateur qui venait de gagner.
@@ -500,6 +511,7 @@ export default function App() {
             onSubmitAnswer={handleSubmitAnswer}
             onUseBonus={handleUseBonus}
             onNextTurn={handleNextTurn}
+            onSetReadingPreference={handleSetReadingPreference}
             onSurpriseWheelDone={handleSurpriseWheelDone}
             onSpinSurpriseWheel={handleSpinSurpriseWheel}
             wedgesToWin={gameState.settings.wedgesToWin}
@@ -529,6 +541,7 @@ export default function App() {
             onSubmitAnswer={handleSubmitAnswer}
             onUseBonus={handleUseBonus}
             onNextTurn={handleNextTurn}
+            onSetReadingPreference={handleSetReadingPreference}
             onSurpriseWheelDone={handleSurpriseWheelDone}
             onSpinSurpriseWheel={handleSpinSurpriseWheel}
             wedgesToWin={gameState.settings.wedgesToWin}
