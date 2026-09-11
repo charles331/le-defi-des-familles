@@ -10,3 +10,6 @@ coverage/
 
 # Scripts de diagnostic jetables (analyses ponctuelles de la banque de questions).
 scripts/tmp/
+
+# Espace de travail local de Claude Code (copies de travail des agents, réglages de session).
+.claude/
