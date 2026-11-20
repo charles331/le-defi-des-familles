@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
-import { mkdir, rename, writeFile } from 'fs/promises';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'fs';
+import { mkdir, open, rename, rm } from 'fs/promises';
 import { randomBytes } from 'crypto';
 import path from 'path';
 import { GameSettings, GameState, Player, Question } from './src/types.js';
@@ -70,7 +70,13 @@ interface StoredFile {
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), '.data');
 const STORE_PATH = path.join(DATA_DIR, 'rooms.json');
-const TEMP_PATH = `${STORE_PATH}.tmp`;
+/**
+ * Un fichier temporaire par écriture. Un nom fixe se partageait entre
+ * l'écriture périodique et celle de l'arrêt (ou celle d'un second processus
+ * pendant un redéploiement) : l'une pouvait renommer le fichier que l'autre
+ * était en train d'écrire.
+ */
+const tempPath = (): string => `${STORE_PATH}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
 
 /** Une salle plus vieille que cela n'est pas rechargée : elle serait balayée. */
 const MAX_RESTORE_AGE_MS = 12 * 60 * 60 * 1000;
@@ -135,8 +141,23 @@ export function saveRooms(rooms: Map<string, PersistableRoom>): void {
   void (async () => {
     try {
       await mkdir(DATA_DIR, { recursive: true });
-      await writeFile(TEMP_PATH, payload, 'utf8');
-      await rename(TEMP_PATH, STORE_PATH);
+      // `fsync` avant le `rename` : sans lui, une coupure de courant peut
+      // laisser un fichier renommé mais vide, le rename atteignant le disque
+      // avant les données.
+      const temp = tempPath();
+      try {
+        const handle = await open(temp, 'w');
+        try {
+          await handle.writeFile(payload, 'utf8');
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(temp, STORE_PATH);
+      } catch (error) {
+        await rm(temp, { force: true });
+        throw error;
+      }
       lastWritten = payload;
     } catch (error) {
       warnOnce(`Impossible d'écrire les parties dans ${STORE_PATH}`, error);
@@ -161,8 +182,15 @@ export function saveRoomsSync(rooms: Map<string, PersistableRoom>): void {
     const payload = serialize(rooms);
     if (payload === lastWritten) return;
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(TEMP_PATH, payload, 'utf8');
-    renameSync(TEMP_PATH, STORE_PATH);
+    const temp = tempPath();
+    const fd = openSync(temp, 'w');
+    try {
+      writeSync(fd, payload, null, 'utf8');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, STORE_PATH);
     lastWritten = payload;
   } catch (error) {
     warnOnce(`Impossible d'écrire les parties dans ${STORE_PATH}`, error);

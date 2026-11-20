@@ -527,3 +527,35 @@ test('un client aux connexions multiples ne bloque pas la file des demandes', as
   assert.match(await refused, /refusé/);
 });
 
+test('une fusion exige que l’appareil du doublon soit connecté', async () => {
+  const { host, roomCode, room, seat } = await tableWithLostSeat();
+  // Un doublon arrivé au salon, puis reparti à son tour.
+  room.gameState.phase = 'lobby';
+  const duplicate = await client();
+  const joined = next(duplicate, 'room-joined');
+  duplicate.emit('join-room', { roomCode, player: { name: 'Chris' } });
+  const duplicateId = (await joined).player.id;
+  room.gameState.phase = 'rolling';
+  duplicate.disconnect();
+  await until(() => !room.sockets.has(duplicateId));
+
+  host.emit('merge-player', { roomCode, sourcePlayerId: duplicateId, targetPlayerId: seat.id });
+  await silence(host, 'game-state-update', 200);
+  assert.equal(seat.isConnected, false);
+  assert.ok(!room.sockets.has(duplicateId));
+});
+
+test('un pion ne se pose pas sur une case qui n’existe pas', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host, 'Charles', { isLocalMode: true });
+  const room = rooms.get(roomCode)!;
+  room.gameState.phase = 'moving';
+  room.gameState.possibleMoves = [];
+  const before = room.gameState.players[0].currentTileId;
+  host.emit('move-player', { roomCode, destinationTileId: 9999 });
+  host.emit('move-player', { roomCode, destinationTileId: { id: 1 } });
+  await silence(host, 'game-state-update', 200);
+  assert.equal(room.gameState.players[0].currentTileId, before);
+  assert.equal(room.gameState.phase, 'moving');
+});
+

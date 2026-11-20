@@ -929,6 +929,10 @@ export function attachGameSocketServer(
       const duplicate = room.gameState.players.find(player => player.id === data.sourcePlayerId);
       if (!seat || !duplicate) return;
       if (duplicate.id.startsWith('local_') || seat.id.startsWith('local_')) return;
+      // L'appareil du doublon reprend le siège : il doit être là pour le
+      // tenir. Fusionner un doublon déconnecté inscrivait dans le salon un
+      // socket fantôme, que plus personne ne pouvait faire jouer.
+      if (!room.sockets.has(data.sourcePlayerId) || !io.sockets.sockets.has(data.sourcePlayerId)) return;
 
       const duplicateName = duplicate.name;
       const merged = mergeSeatInto(room.gameState, data.sourcePlayerId, data.targetPlayerId);
@@ -1379,14 +1383,16 @@ export function attachGameSocketServer(
         data.destinationTileId = room.gameState.possibleMoves[0];
       }
 
-      const activePlayer = room.gameState.players[room.gameState.activePlayerIndex];
-      activePlayer.currentTileId = data.destinationTileId;
-      room.gameState.selectedTileId = data.destinationTileId;
-
+      // La case se vérifie avant d'y poser le pion : sans destination calculée,
+      // la valeur du client était recopiée telle quelle, et un pion pouvait
+      // finir sur une case qui n'existe pas — ou sur un objet.
       const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
       const tile = board.tiles.find(t => t.id === data.destinationTileId);
-
       if (!tile) return;
+
+      const activePlayer = room.gameState.players[room.gameState.activePlayerIndex];
+      activePlayer.currentTileId = tile.id;
+      room.gameState.selectedTileId = tile.id;
 
       if (tile.type === 'reroll') {
         // Re-roll tile: player gets another roll!
