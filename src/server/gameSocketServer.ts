@@ -27,23 +27,20 @@ import {
   describeSeatRequest,
 } from './seatRequests';
 import {
-  MAX_ACTIVE_THEME_NAMES,
   defaultSettings,
   isPlainObject,
   sanitizeAvatarId,
   sanitizeColor,
-  sanitizeCustomPack,
   sanitizeDifficulty,
   sanitizePlayerName,
   sanitizePlayerProfile,
   sanitizeSettings,
-  sanitizeThemeNames,
 } from './inputValidation';
 import { generateRoomCode, normalizeRoomCode } from './roomCodes';
 import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin } from './socketGuards';
 import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
 import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
-import { activeThemeKeys, pickQuestionForPlayer } from './questionSelection';
+import { pickQuestionForPlayer } from './questionSelection';
 import {
   BIG_LEAP_BONUS,
   BONUS_ROSTER,
@@ -119,8 +116,8 @@ const positiveDuration = (value: string | undefined, fallback: number): number =
 };
 const MAX_ROOMS = 250;
 const MAX_PLAYERS_PER_ROOM = 12;
-const MAX_CUSTOM_PACKS_PER_ROOM = 3;
-const MAX_CUSTOM_QUESTIONS_PER_ROOM = 180;
+export const MAX_CUSTOM_PACKS_PER_ROOM = 3;
+export const MAX_CUSTOM_QUESTIONS_PER_ROOM = 180;
 // Dix minutes : après un redéploiement ou une coupure de réseau, il faut laisser
 // à toute la famille le temps de revenir avant de fermer le salon.
 const HOST_RECONNECT_GRACE_MS = positiveDuration(process.env.ROOM_HOST_GRACE_MS, 10 * 60 * 1000);
@@ -143,11 +140,12 @@ const ROOM_SWEEP_INTERVAL_MS = positiveDuration(process.env.ROOM_SWEEP_INTERVAL_
  * Le défaut de socket.io est d'un mégaoctet : assez pour qu'un seul client
  * envoie des chaînes géantes, que le serveur recopiait dans l'état puis
  * renvoyait à chaque joueur du salon et resérialisait toutes les trois secondes.
- * Le plus gros message légitime est un pack de soixante cartes ; un pack au
- * plafond de chaque champ tient dans cette limite (vérifié par
- * `tests/inputValidation.test.ts`).
+ * Depuis que les packs générés ne transitent plus par le client, les plus gros
+ * messages légitimes sont les descriptions de session WebRTC du direct : une
+ * offre audio et vidéo pèse quelques kilo-octets, rarement plus de vingt. La
+ * limite leur laisse une large marge (vérifié par `tests/inputValidation.test.ts`).
  */
-export const MAX_SOCKET_PAYLOAD_BYTES = 128 * 1024;
+export const MAX_SOCKET_PAYLOAD_BYTES = 64 * 1024;
 
 /**
  * Les plafonds contre un client qui abuse. Réglables pour les tests, où tous
@@ -200,6 +198,8 @@ export interface GameSocketServerOptions {
 
 export interface GameSocketServer {
   io: Server;
+  /** Envoie à chaque membre du salon sa vue de l'état (utilisé par la route de génération). */
+  emitGameState(room: Room): void;
   /** Arrête le balayage des salons et ferme socket.io. */
   close(): Promise<void>;
 }
@@ -1049,71 +1049,9 @@ export function attachGameSocketServer(
       emitGameState(room);
     });
 
-    // Add Custom AI Theme Pack
-    on('add-custom-pack', (data: { roomCode: string; themeName?: unknown; questions?: unknown }) => {
-      const room = getRoom(data.roomCode, socket.id);
-      if (!room || room.hostSocketId !== socket.id) return;
-
-      // Chaque carte est refaite par le serveur : identifiant neuf, thème du
-      // pack, forme contrôlée. Une carte `null` ou sans propositions faisait
-      // planter le tirage — et la sauvegarde la rejouait à chaque démarrage.
-      const stamp = `${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
-      const pack = sanitizeCustomPack(data.themeName, data.questions, index => `custom_${stamp}_${index}`);
-      if ('error' in pack) return socket.emit('error-msg', pack.error);
-      const { themeName, questions } = pack;
-      const themeKey = themeName.toLowerCase();
-
-      if (!room.gameState.customPacks) {
-        room.gameState.customPacks = [];
-      }
-
-      const existingIndex = room.gameState.customPacks.findIndex(
-        p => p.name.toLowerCase().trim() === themeKey
-      );
-
-      const currentCustomQuestionCount = room.gameState.customPacks.reduce(
-        (total, pack) => total + pack.questions.length,
-        0
-      );
-      if (currentCustomQuestionCount + questions.length > MAX_CUSTOM_QUESTIONS_PER_ROOM) {
-        return socket.emit('error-msg', 'Ce salon a atteint sa limite de questions personnalisées.');
-      }
-      if (existingIndex < 0 && room.gameState.customPacks.length >= MAX_CUSTOM_PACKS_PER_ROOM) {
-        return socket.emit('error-msg', 'Ce salon a atteint sa limite de thèmes personnalisés.');
-      }
-
-      if (existingIndex >= 0) {
-        // Les cartes ajoutées portent le nom du pack existant, pas sa variante
-        // de casse : le tirage les rapproche par ce nom.
-        const existing = room.gameState.customPacks[existingIndex];
-        existing.questions.push(...questions.map(question => ({ ...question, themePack: existing.name })));
-      } else {
-        room.gameState.customPacks.push({
-          name: themeName,
-          questions,
-        });
-      }
-
-      // Le thème fraîchement généré rejoint les thèmes actifs, sans désactiver
-      // les autres : la table peut jouer avec ses trois thèmes à la fois.
-      if (!activeThemeKeys(room.settings).has(themeKey)) {
-        const activeNames = sanitizeThemeNames([
-          ...(room.settings.customThemePackNames ?? []),
-          ...(room.settings.customThemePackName ? [room.settings.customThemePackName] : []),
-          themeName,
-        ], MAX_ACTIVE_THEME_NAMES);
-        room.settings.customThemePackNames = activeNames;
-        room.settings.customThemePackName = undefined;
-        room.gameState.settings.customThemePackNames = activeNames;
-        room.gameState.settings.customThemePackName = undefined;
-      }
-
-      // Merge into room's active questions pool
-      room.gameState.questionsPool = [...questions, ...room.gameState.questionsPool];
-
-      emitGameState(room);
-      console.log(`[Pack IA] ${questions.length} questions ajoutées pour "${themeName}" dans le salon ${room.code}`);
-    });
+    // Plus d'événement `add-custom-pack` : un pack généré est rangé dans le salon
+    // par la route /api/generate-pack elle-même, le client ne fournit plus de
+    // questions (voir addGeneratedPackToRoom dans server.ts).
 
     /**
      * Retour au salon depuis l'écran de victoire.
@@ -1725,6 +1663,7 @@ export function attachGameSocketServer(
   });
   return {
     io,
+    emitGameState,
     close: () => new Promise<void>((resolve) => {
       clearInterval(roomSweep);
       for (const timer of seatRequestTimers.values()) clearTimeout(timer);

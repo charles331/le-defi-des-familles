@@ -410,6 +410,9 @@ export function checkStore(): void {
 export function startRoomPersistence(
   rooms: Map<string, PersistableRoom>,
   intervalMs = 3000,
+  // Fermeture des connexions, appelée une fois la sauvegarde écrite : c'est la
+  // sauvegarde qui compte, elle passe donc en premier.
+  closeConnections?: () => Promise<void>,
 ): void {
   const timer = setInterval(() => saveRooms(rooms), intervalMs);
   timer.unref?.();
@@ -421,7 +424,14 @@ export function startRoomPersistence(
     clearInterval(timer);
     saveRoomsSync(rooms);
     console.log(`💾 Parties sauvegardées avant l'arrêt (${signal}).`);
-    process.exit(0);
+    if (!closeConnections) process.exit(0);
+    // Une connexion qui traîne ne doit pas retenir l'arrêt au-delà du délai
+    // que laisse l'hébergeur avant de tuer le conteneur.
+    const forced = setTimeout(() => process.exit(0), 5000);
+    forced.unref?.();
+    closeConnections()
+      .catch((error) => console.warn('Fermeture des connexions incomplète :', error))
+      .finally(() => process.exit(0));
   };
   process.on('SIGTERM', () => stop('SIGTERM'));
   process.on('SIGINT', () => stop('SIGINT'));

@@ -154,34 +154,6 @@ test('create-room passe par sanitizeSettings', async () => {
   assert.deepEqual(settings.selectedCategories, []);
 });
 
-test('un pack contenant une question null est refusé', async () => {
-  const host = await client();
-  const { roomCode } = await createRoom(host);
-  const refused = next(host, 'error-msg');
-  host.emit('add-custom-pack', { roomCode, themeName: 'Piège', questions: [null] });
-  assert.match(await refused, /invalide/);
-  assert.equal(rooms.get(roomCode)!.gameState.customPacks?.length ?? 0, 0);
-
-  const accepted = next(host, 'game-state-update');
-  host.emit('add-custom-pack', {
-    roomCode,
-    themeName: 'Harry Potter',
-    questions: [{
-      id: 'q_choisi_par_le_client',
-      categoryId: 'cinema',
-      question: 'Quel sorcier porte une cicatrice en forme d’éclair ?',
-      options: ['Harry', 'Ron', 'Drago', 'Neville'],
-      correctAnswerIndex: 0,
-      difficulty: 'ado',
-    }],
-  });
-  await accepted;
-  const pack = rooms.get(roomCode)!.gameState.customPacks![0];
-  assert.equal(pack.questions.length, 1);
-  assert.notEqual(pack.questions[0].id, 'q_choisi_par_le_client');
-  assert.equal(pack.questions[0].themePack, 'Harry Potter');
-});
-
 async function tableOfTwo() {
   const host = await client();
   const { roomCode } = await createRoom(host, 'Charles');

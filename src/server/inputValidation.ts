@@ -34,7 +34,7 @@ export const MAX_CUSTOM_QUESTION_LENGTH = 300;
 export const MAX_CUSTOM_OPTION_LENGTH = 120;
 export const MAX_CUSTOM_EXPLANATION_LENGTH = 400;
 export const MAX_CUSTOM_ANSWER_LENGTH = 120;
-/** Un pack envoyé en une fois : la génération en livre soixante au plus. */
+/** Un pack de la génération en compte soixante au plus. */
 export const MAX_QUESTIONS_PER_PACK = 60;
 /** Thèmes actifs retenus dans les réglages : bien plus que les trois packs possibles. */
 export const MAX_ACTIVE_THEME_NAMES = 12;
@@ -203,35 +203,6 @@ export function sanitizeCustomQuestion(
   if (format !== 'mcq') clean.format = format;
   if (answer) clean.answer = answer;
   return clean;
-}
-
-export type CustomPackResult =
-  | { ok: true; themeName: string; questions: Question[] }
-  | { ok: false; error: string };
-
-/**
- * Un pack envoyé par l'organisateur : un thème et entre une et soixante cartes,
- * toutes valides. Une seule carte malformée fait refuser l'envoi entier — le
- * client légitime n'en produit jamais, et l'accepter en partie cacherait le
- * problème.
- */
-export function sanitizeCustomPack(
-  rawThemeName: unknown,
-  rawQuestions: unknown,
-  makeId: (index: number) => string,
-): CustomPackResult {
-  const themeName = sanitizeThemeName(rawThemeName);
-  if (!themeName) return { ok: false, error: 'Nom de thème invalide.' };
-  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0 || rawQuestions.length > MAX_QUESTIONS_PER_PACK) {
-    return { ok: false, error: `Un pack doit contenir entre 1 et ${MAX_QUESTIONS_PER_PACK} questions.` };
-  }
-  const questions: Question[] = [];
-  for (let index = 0; index < rawQuestions.length; index += 1) {
-    const question = sanitizeCustomQuestion(rawQuestions[index], { id: makeId(index), themePack: themeName });
-    if (!question) return { ok: false, error: 'Ce pack contient une question invalide.' };
-    questions.push(question);
-  }
-  return { ok: true, themeName, questions };
 }
 
 /** Un identifiant relu du disque : court, imprimable, sans surprise. */

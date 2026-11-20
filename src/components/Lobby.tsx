@@ -41,7 +41,6 @@ interface LobbyProps {
   onToggleReady: () => void;
   onUpdateSettings: (settings: Partial<GameSettings>) => void;
   onStartGame: () => void;
-  onAddCustomPack?: (themeName: string, questions: any[]) => void;
   onLeaveGame?: () => void;
   errorMessage?: string | null;
 }
@@ -59,7 +58,6 @@ export const Lobby: React.FC<LobbyProps> = ({
   onToggleReady,
   onUpdateSettings,
   onStartGame,
-  onAddCustomPack,
   onLeaveGame,
   errorMessage
 }) => {
@@ -445,7 +443,6 @@ export const Lobby: React.FC<LobbyProps> = ({
                       isHost={isHost}
                       generationToken={generationToken}
                       onUpdateSettings={onUpdateSettings}
-                      onAddCustomPack={onAddCustomPack}
                       customPacks={gameState.customPacks}
                     />
                   </React.Suspense>

@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { resolveBoardCategories } from '../src/data/boards';
-import { QUESTIONS_DATABASE } from '../src/data/questions';
 import { MAX_SOCKET_PAYLOAD_BYTES } from '../src/server/gameSocketServer';
 import {
   MAX_CUSTOM_EXPLANATION_LENGTH,
   MAX_CUSTOM_OPTION_LENGTH,
   MAX_CUSTOM_QUESTION_LENGTH,
-  MAX_QUESTIONS_PER_PACK,
   cleanText,
   reviveStoredPlayer,
   reviveStoredSettings,
   sanitizeAvatarId,
   sanitizeColor,
-  sanitizeCustomPack,
   sanitizeCustomQuestion,
   sanitizeDifficulty,
   sanitizePlayerName,
@@ -163,44 +160,14 @@ test('Vrai/Faux et carte ouverte gardent leur forme', () => {
   assert.equal(open?.answer, 'Harry Potter');
 });
 
-test('une seule carte malformée fait refuser le pack entier', () => {
-  const ok = sanitizeCustomPack('  Harry   Potter ', [validQuestion, validQuestion], i => `id_${i}`);
-  assert.ok(ok.ok && ok.themeName === 'Harry Potter' && ok.questions[1].id === 'id_1');
-  assert.equal(sanitizeCustomPack('Harry Potter', [validQuestion, null], i => `${i}`).ok, false);
-  assert.equal(sanitizeCustomPack(undefined, [validQuestion], i => `${i}`).ok, false);
-  assert.equal(sanitizeCustomPack('T', [], i => `${i}`).ok, false);
-  assert.equal(sanitizeCustomPack('T', Array(61).fill(validQuestion), i => `${i}`).ok, false);
-  assert.equal(sanitizeCustomPack('T', 'pas un tableau', i => `${i}`).ok, false);
-});
-
-test('un pack de soixante cartes au plafond tient dans un message', () => {
-  // Texte français ordinaire, accents compris, étiré jusqu'au plafond de chaque
-  // champ : c'est le plus gros message qu'un client légitime puisse envoyer.
-  const french = 'Quelle célèbre œuvre française évoque été, Noël et forêt à la fois ? ';
-  const fill = (length: number) => french.repeat(Math.ceil(length / french.length)).slice(0, length).trim();
-  const question = {
-    id: 'gen_1700000000000_59',
-    categoryId: 'gastronomie',
-    question: fill(MAX_CUSTOM_QUESTION_LENGTH),
-    options: Array(4).fill(null).map(() => fill(MAX_CUSTOM_OPTION_LENGTH)),
-    correctAnswerIndex: 3,
-    explanation: fill(MAX_CUSTOM_EXPLANATION_LENGTH),
-    difficulty: 'adulte',
-    format: 'mcq',
-    answer: '',
-    themePack: 'x'.repeat(100),
-  };
-  const payload = { roomCode: 'FAM-ABCDEF', themeName: 'x'.repeat(100), questions: Array(MAX_QUESTIONS_PER_PACK).fill(question) };
-  const bytes = Buffer.byteLength(`42${JSON.stringify(['add-custom-pack', payload])}`);
-  assert.ok(sanitizeCustomPack(payload.themeName, payload.questions, i => `${i}`).ok);
-  assert.ok(bytes < MAX_SOCKET_PAYLOAD_BYTES, `${bytes} octets pour une limite de ${MAX_SOCKET_PAYLOAD_BYTES}`);
-
-  // Et les soixante plus longues cartes de la banque, pour un ordre de grandeur réel.
-  const longest = [...QUESTIONS_DATABASE]
-    .sort((a, b) => JSON.stringify(b).length - JSON.stringify(a).length)
-    .slice(0, MAX_QUESTIONS_PER_PACK);
-  const realBytes = Buffer.byteLength(JSON.stringify(['add-custom-pack', { ...payload, questions: longest }]));
-  assert.ok(realBytes < MAX_SOCKET_PAYLOAD_BYTES / 2, `${realBytes} octets`);
+test('une description WebRTC tient largement dans un message', () => {
+  // Les packs ne transitent plus par le client : les plus gros messages
+  // légitimes sont désormais les offres du direct. Une offre très chargée
+  // (audio, vidéo, nombreux codecs et candidats) dépasse rarement 20 ko.
+  const sdp = 'a=rtpmap:96 VP8/90000\r\n'.repeat(1000).slice(0, 20_000);
+  const payload = { roomCode: 'FAM-ABCDEF', targetPlayerId: 'x'.repeat(20), offer: { type: 'offer', sdp } };
+  const bytes = Buffer.byteLength(`42${JSON.stringify(['webrtc-offer', payload])}`);
+  assert.ok(bytes * 2 < MAX_SOCKET_PAYLOAD_BYTES, `${bytes} octets pour une limite de ${MAX_SOCKET_PAYLOAD_BYTES}`);
 });
 
 test('un code de salon garde sa forme, quatre ou six caractères', () => {
