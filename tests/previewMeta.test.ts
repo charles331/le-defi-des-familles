@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { previewOrigin, withAbsolutePreviewImages } from '../src/server/previewMeta';
+import {
+  escapeHtmlAttribute,
+  previewOrigin,
+  requestOrigin,
+  withAbsolutePreviewImages,
+} from '../src/server/previewMeta';
 
 const indexHtml = readFileSync(path.join(process.cwd(), 'index.html'), 'utf-8');
 
@@ -60,4 +65,32 @@ test('la page annonce bien un visuel d’aperçu et ses icônes', () => {
   ]) {
     assert.ok(indexHtml.includes(expected), `balise manquante : ${expected}`);
   }
+});
+
+test('un en-tête Host piégé ne sort pas de la balise meta', () => {
+  const hostile = (host: string, protocol = 'https') => ({
+    protocol,
+    get: (header: string) => (header === 'host' ? host : undefined),
+  });
+
+  for (const host of ['x"><script>alert(1)</script>', "jeu.be'onload=x", 'jeu.be/chemin', 'jeu .be', 'a@b']) {
+    assert.equal(previewOrigin(hostile(host), undefined), '', `hôte refusé : ${host}`);
+  }
+  assert.equal(previewOrigin(hostile('jeu.be', 'javascript'), undefined), '', 'protocole refusé');
+  assert.equal(previewOrigin(hostile('Jeu.Example.com:8443'), undefined), 'https://jeu.example.com:8443');
+  assert.equal(requestOrigin(hostile('localhost:3000', 'http')), 'http://localhost:3000');
+});
+
+test('PUBLIC_ORIGIN prime sur l’hôte de la requête, et doit être une adresse http(s)', () => {
+  const request = { protocol: 'https', get: () => 'attaquant.example' };
+  assert.equal(previewOrigin(request, 'https://jeu.famille.be/chemin?x=1'), 'https://jeu.famille.be');
+  assert.equal(previewOrigin(request, 'javascript:alert(1)'), 'https://attaquant.example');
+  assert.equal(previewOrigin(request, 'pas une adresse'), 'https://attaquant.example');
+});
+
+test('l’origine est échappée dans l’attribut, quoi qu’on lui passe', () => {
+  assert.equal(escapeHtmlAttribute(`a"b'c<d>e&f`), 'a&quot;b&#39;c&lt;d&gt;e&amp;f');
+  const rendered = withAbsolutePreviewImages(indexHtml, 'https://x"><script>');
+  assert.ok(!rendered.includes('"><script>'));
+  assert.match(rendered, /content="https:\/\/x&quot;&gt;&lt;script&gt;\/og-image\.png"/);
 });
