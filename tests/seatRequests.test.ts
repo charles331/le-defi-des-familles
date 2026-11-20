@@ -3,8 +3,13 @@ import test from 'node:test';
 import {
   HOST_NAME_REFUSAL,
   NAME_TAKEN_REFUSAL,
+  QUEUE_FULL,
+  REFUSED_RECENTLY,
+  SEAT_REFUSAL_COOLDOWN_MS,
   SEAT_REQUEST_TTL_MS,
   SeatRequest,
+  TOO_MANY_FROM_ADDRESS,
+  admitSeatRequest,
   decideArrival,
   describeSeatRequest,
   isExpired,
@@ -63,7 +68,7 @@ test('un prénom porté par un joueur présent est refusé', () => {
 
 test('une demande expire au bout de deux minutes', () => {
   const request: SeatRequest = {
-    id: 'r', socketId: 's', kind: 'join', seatId: null, name: 'Thomas',
+    id: 'r', socketId: 's', addressKey: '192.0.2.1', kind: 'join', seatId: null, name: 'Thomas',
     avatarId: 'fox', color: '#3B82F6', difficulty: 'ado', createdAt: 1000,
   };
   assert.ok(!isExpired(request, 1000 + SEAT_REQUEST_TTL_MS - 1));
@@ -72,9 +77,48 @@ test('une demande expire au bout de deux minutes', () => {
 
 test('l’organisateur voit ce qu’il rend, jamais l’identifiant d’un socket', () => {
   const view = describeSeatRequest({
-    id: 'r', socketId: 'socket-secret', kind: 'reclaim', seatId: 'seat-christelle', name: 'christelle',
+    id: 'r', socketId: 'socket-secret', addressKey: '192.0.2.1', kind: 'reclaim', seatId: 'seat-christelle', name: 'christelle',
     avatarId: 'owl', color: '#3B82F6', difficulty: 'ado', createdAt: 0,
   }, table());
   assert.deepEqual(view, { id: 'r', kind: 'reclaim', name: 'Christelle', avatarId: 'lion', color: '#000000', wedgeCount: 4 });
   assert.ok(!JSON.stringify(view).includes('socket-secret'));
+  assert.ok(!JSON.stringify(view).includes('192.0.2.1'));
+});
+
+function pending(socketId: string, addressKey: string, createdAt = 0): SeatRequest {
+  return {
+    id: socketId, socketId, addressKey, kind: 'join', seatId: null, name: socketId,
+    avatarId: 'fox', color: '#3B82F6', difficulty: 'ado', createdAt,
+  };
+}
+
+test('une même adresse ne remplit pas la file à elle seule', () => {
+  // L'attaquant ouvre autant de connexions qu'il veut, depuis la même box.
+  const queue = [pending('a1', '203.0.113.9'), pending('a2', '203.0.113.9')];
+  assert.deepEqual(admitSeatRequest(queue, { socketId: 'a3', addressKey: '203.0.113.9' }, undefined, 1), {
+    ok: false, message: TOO_MANY_FROM_ADDRESS,
+  });
+  // La famille, ailleurs, dépose toujours la sienne.
+  assert.deepEqual(admitSeatRequest(queue, { socketId: 'f1', addressKey: '198.51.100.4' }, undefined, 1), { ok: true });
+  // Une connexion n'a qu'une demande à la fois.
+  assert.equal(admitSeatRequest(queue, { socketId: 'a1', addressKey: '198.51.100.4' }, undefined, 1).ok, false);
+});
+
+test('la file d’un salon reste bornée, et une demande expirée n’y compte plus', () => {
+  const queue = [1, 2, 3, 4, 5].map(i => pending(`s${i}`, `192.0.2.${i}`));
+  assert.deepEqual(admitSeatRequest(queue, { socketId: 'x', addressKey: '192.0.2.99' }, undefined, 1), {
+    ok: false, message: QUEUE_FULL,
+  });
+  assert.deepEqual(
+    admitSeatRequest(queue, { socketId: 'x', addressKey: '192.0.2.99' }, undefined, SEAT_REQUEST_TTL_MS + 1),
+    { ok: true },
+  );
+});
+
+test('après un refus, l’adresse attend avant de redemander', () => {
+  const until = 1000 + SEAT_REFUSAL_COOLDOWN_MS;
+  assert.deepEqual(admitSeatRequest([], { socketId: 'x', addressKey: 'a' }, until, 1000), {
+    ok: false, message: REFUSED_RECENTLY,
+  });
+  assert.deepEqual(admitSeatRequest([], { socketId: 'x', addressKey: 'a' }, until, until), { ok: true });
 });

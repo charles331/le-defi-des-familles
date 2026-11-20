@@ -18,9 +18,11 @@ import { createGameStateView, isDesignatedReader } from './gameStateView';
 import { judgeAnswer } from './answerRules';
 import { describeRecoveredSeat, mergeSeatInto, normalizeSeatName } from './seats';
 import {
-  MAX_SEAT_REQUESTS_PER_ROOM,
+  REFUSED_RECENTLY,
+  SEAT_REFUSAL_COOLDOWN_MS,
   SEAT_REQUEST_TTL_MS,
   SeatRequest,
+  admitSeatRequest,
   decideArrival,
   describeSeatRequest,
 } from './seatRequests';
@@ -97,6 +99,8 @@ export interface Room {
   creatorKey?: string;
   /** Demandes d’entrée en attente de l’organisateur ; jamais sauvegardées. */
   seatRequests?: SeatRequest[];
+  /** Adresses éconduites par l’organisateur, et jusqu’à quand. */
+  seatRefusals?: Map<string, number>;
 }
 
 /** Mélange de Fisher-Yates, partagé par le démarrage de partie et la reprise. */
@@ -700,6 +704,12 @@ export function attachGameSocketServer(
       if (room.sockets.has(socket.id)) {
         return socket.emit('error-msg', 'Vous êtes déjà à cette table.');
       }
+      // Refusée par l'organisateur il y a peu, l'adresse ne revient pas
+      // aussitôt — ni par une demande, ni par la reprise automatique qui
+      // s'ouvrirait si l'organisateur perdait le réseau entre-temps.
+      if ((room.seatRefusals?.get(addressOfClient) ?? 0) > Date.now()) {
+        return socket.emit('error-msg', REFUSED_RECENTLY);
+      }
 
       const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
       // Pour une reprise, l'avatar ne change que s'il a vraiment été choisi.
@@ -739,12 +749,17 @@ export function attachGameSocketServer(
       }
 
       const requests = seatRequestsOf(room);
-      if (requests.length >= MAX_SEAT_REQUESTS_PER_ROOM) {
-        return socket.emit('error-msg', 'L’organisateur a déjà plusieurs demandes en attente. Réessayez dans un instant.');
-      }
+      const admission = admitSeatRequest(
+        requests,
+        { socketId: socket.id, addressKey: addressOfClient },
+        room.seatRefusals?.get(addressOfClient),
+        Date.now(),
+      );
+      if ('message' in admission) return socket.emit('error-msg', admission.message);
       const request: SeatRequest = {
         id: randomBytes(9).toString('base64url'),
         socketId: socket.id,
+        addressKey: addressOfClient,
         kind: decision.kind === 'ask-reclaim' ? 'reclaim' : 'join',
         seatId: decision.kind === 'ask-reclaim' ? decision.seat.id : null,
         name: decision.kind === 'ask-reclaim'
@@ -775,6 +790,14 @@ export function attachGameSocketServer(
       if (!request) return;
       dropSeatRequest(room, request.id);
 
+      if (data.accept !== true) {
+        // Le refus vaut pour l'adresse : sans ce délai, l'intrus éconduit
+        // redéposait sa demande dans la seconde, sous un autre prénom.
+        if (!room.seatRefusals) room.seatRefusals = new Map();
+        const now = Date.now();
+        for (const [address, until] of room.seatRefusals) if (until <= now) room.seatRefusals.delete(address);
+        room.seatRefusals.set(request.addressKey, now + SEAT_REFUSAL_COOLDOWN_MS);
+      }
       const requester = io.sockets.sockets.get(request.socketId);
       if (!requester || room.sockets.has(requester.id)) return;
       if (data.accept !== true) {

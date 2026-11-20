@@ -485,3 +485,45 @@ test('une bonne réponse arrivée après le minuteur compte comme un temps écou
   assert.equal(room.gameState.lastAnswerResult?.selectedOption, -1);
 });
 
+test('un client aux connexions multiples ne bloque pas la file des demandes', async () => {
+  const { host, roomCode, room } = await tableOfTwo();
+  room.gameState.phase = 'rolling';
+  // Le serveur lit l'adresse dans la dernière entrée de X-Forwarded-For, comme
+  // derrière le proxy de Railway : de quoi simuler deux foyers.
+  const attackerAddress = { 'X-Forwarded-For': '203.0.113.9' };
+  const attackers: ClientSocket[] = [];
+  const outcomes: string[] = [];
+  for (let i = 0; i < 6; i += 1) {
+    const socket = await client(url, attackerAddress);
+    attackers.push(socket);
+    const outcome = Promise.race([
+      next(socket, 'seat-request-pending').then(() => 'attente'),
+      next(socket, 'error-msg').then(() => 'refus'),
+    ]);
+    socket.emit('join-room', { roomCode, player: { name: `Intrus ${i}` } });
+    outcomes.push(await outcome);
+  }
+  assert.deepEqual(outcomes, ['attente', 'attente', 'refus', 'refus', 'refus', 'refus']);
+
+  const family = await client(url, { 'X-Forwarded-For': '198.51.100.4' });
+  const pending = next(family, 'seat-request-pending');
+  family.emit('join-room', { roomCode, player: { name: 'Thomas' } });
+  assert.equal((await pending).name, 'Thomas');
+  assert.equal(room.seatRequests?.length, 3);
+
+  // Une connexion qui s'en va emporte sa demande.
+  const leavingId = attackers[0].id;
+  attackers[0].disconnect();
+  await until(() => room.seatRequests?.length === 2);
+  assert.ok(!room.seatRequests!.some(request => request.socketId === leavingId));
+
+  // Éconduite, l'adresse ne revient pas aussitôt, même par une connexion neuve.
+  const [intruderRequest] = room.seatRequests!.filter(request => request.name.startsWith('Intrus'));
+  host.emit('answer-seat-request', { roomCode, requestId: intruderRequest.id, accept: false });
+  await until(() => room.seatRefusals?.has('203.0.113.9') === true);
+  const again = await client(url, attackerAddress);
+  const refused = next(again, 'error-msg');
+  again.emit('join-room', { roomCode, player: { name: 'Intrus encore' } });
+  assert.match(await refused, /refusé/);
+});
+

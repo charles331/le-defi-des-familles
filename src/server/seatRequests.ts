@@ -78,6 +78,8 @@ export interface SeatRequest {
   id: string;
   /** L'appareil qui demande, et qui recevra la place. */
   socketId: string;
+  /** Adresse du demandeur (un /64 en IPv6), voir `socketGuards.clientAddress`. */
+  addressKey: string;
   kind: 'reclaim' | 'join';
   /** Le siège visé par une reprise ; `null` pour une arrivée. */
   seatId: string | null;
@@ -92,6 +94,47 @@ export interface SeatRequest {
 export const SEAT_REQUEST_TTL_MS = 2 * 60 * 1000;
 /** Une table de famille n'attend jamais plus de quelques retours à la fois. */
 export const MAX_SEAT_REQUESTS_PER_ROOM = 5;
+
+/**
+ * Deux demandes à la fois depuis une même adresse : une famille qui revient à
+ * deux sur le même Wi-Fi passe, un client qui ouvre dix connexions pour remplir
+ * la file — et faire refuser les vrais joueurs (« l'organisateur a déjà
+ * plusieurs demandes ») — ne passe pas.
+ */
+export const MAX_SEAT_REQUESTS_PER_ADDRESS = 2;
+/** Après un refus de l'organisateur, l'adresse attend avant de redemander. */
+export const SEAT_REFUSAL_COOLDOWN_MS = 3 * 60 * 1000;
+
+export const REFUSED_RECENTLY =
+  'L’organisateur a refusé une demande venue de votre connexion. Réessayez dans quelques minutes.';
+export const TOO_MANY_FROM_ADDRESS =
+  'Plusieurs demandes venues de votre connexion attendent déjà l’organisateur. Patientez un instant.';
+export const QUEUE_FULL =
+  'L’organisateur a déjà plusieurs demandes en attente. Réessayez dans un instant.';
+
+/**
+ * Une nouvelle demande peut-elle entrer dans la file d'un salon ?
+ *
+ * Une par connexion (la nouvelle remplace l'ancienne : l'appelant retire
+ * d'abord celles de la connexion), deux par adresse, cinq par salon, et aucune
+ * pendant le délai qui suit un refus de l'organisateur.
+ */
+export function admitSeatRequest(
+  requests: readonly SeatRequest[],
+  candidate: { socketId: string; addressKey: string },
+  refusedUntil: number | undefined,
+  now: number,
+): { ok: true } | { ok: false; message: string } {
+  if (refusedUntil !== undefined && refusedUntil > now) return { ok: false, message: REFUSED_RECENTLY };
+  const pending = requests.filter(request => !isExpired(request, now));
+  if (pending.some(request => request.socketId === candidate.socketId)) {
+    return { ok: false, message: TOO_MANY_FROM_ADDRESS };
+  }
+  const fromAddress = pending.filter(request => request.addressKey === candidate.addressKey).length;
+  if (fromAddress >= MAX_SEAT_REQUESTS_PER_ADDRESS) return { ok: false, message: TOO_MANY_FROM_ADDRESS };
+  if (pending.length >= MAX_SEAT_REQUESTS_PER_ROOM) return { ok: false, message: QUEUE_FULL };
+  return { ok: true };
+}
 
 export function isExpired(request: SeatRequest, now: number): boolean {
   return now - request.createdAt >= SEAT_REQUEST_TTL_MS;
