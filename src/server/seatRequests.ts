@@ -140,8 +140,10 @@ export function recordRefusal(refusals: SeatRefusals, addressKey: string, name: 
   refusals.set(refusalKeyForName(addressKey, name), now + SEAT_REFUSAL_COOLDOWN_MS);
 }
 
+// Sans durée : le délai va de trente secondes (autre prénom de la maison) à
+// trois minutes (le prénom refusé). « Quelques minutes » trompait le premier.
 export const REFUSED_RECENTLY =
-  'L’organisateur a refusé une demande venue de votre connexion. Réessayez dans quelques minutes.';
+  'L’organisateur a refusé une demande venue de votre connexion. Réessayez un peu plus tard.';
 export const TOO_MANY_FROM_ADDRESS =
   'Plusieurs demandes venues de votre connexion attendent déjà l’organisateur. Patientez un instant.';
 export const QUEUE_FULL =
