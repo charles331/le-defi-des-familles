@@ -7,6 +7,8 @@
  * ce qui les rend testables sans attendre (`tests/socketGuards.test.ts`).
  */
 
+import { timingSafeEqual } from 'crypto';
+
 /**
  * Seau à jetons : `capacity` événements d'affilée, puis `refillPerSecond` par
  * seconde. Une rafale courte passe — un clic répété, une salve de candidats
@@ -166,4 +168,19 @@ export function parsePublicOrigins(raw: string | undefined): string[] {
         return [];
       }
     });
+}
+
+/**
+ * Compare un jeton reçu d'un client à celui que le serveur a tiré, en temps
+ * constant. Le jeton de session et celui de génération passent tous deux par
+ * ici : la route HTTP et le serveur temps réel en gardaient chacun leur copie.
+ * Tout ce qui n'est pas une chaîne non vide est refusé — le client envoie ce
+ * qu'il veut.
+ */
+export function safeTokenEquals(actual: unknown, expected: string): boolean {
+  if (typeof actual !== 'string' || !actual) return false;
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length
+    && timingSafeEqual(actualBuffer, expectedBuffer);
 }

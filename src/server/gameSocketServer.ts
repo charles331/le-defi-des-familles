@@ -1,5 +1,5 @@
 import type { Server as HttpServer } from 'http';
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { randomBytes } from 'crypto';
 import { Server, Socket } from 'socket.io';
 import { QUESTIONS_DATABASE } from '../data/questions';
 import { BOARD_CATEGORY_COUNT, buildBoard, resolveBoardCategories } from '../data/boards';
@@ -37,7 +37,7 @@ import {
   sanitizeSettings,
 } from './inputValidation';
 import { generateRoomCode, normalizeRoomCode } from './roomCodes';
-import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin } from './socketGuards';
+import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin, safeTokenEquals } from './socketGuards';
 import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
 import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
 import { pickQuestionForPlayer } from './questionSelection';
@@ -202,14 +202,6 @@ export interface GameSocketServer {
   emitGameState(room: Room): void;
   /** Arrête le balayage des salons et ferme socket.io. */
   close(): Promise<void>;
-}
-
-function safeTokenEquals(actual: unknown, expected: string): boolean {
-  if (typeof actual !== 'string' || !actual) return false;
-  const actualBuffer = Buffer.from(actual);
-  const expectedBuffer = Buffer.from(expected);
-  return actualBuffer.length === expectedBuffer.length
-    && timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 export function attachGameSocketServer(

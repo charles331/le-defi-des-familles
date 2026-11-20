@@ -1,6 +1,5 @@
 import express from 'express';
 import path from 'path';
-import { timingSafeEqual } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { createServer } from 'http';
 import { QUESTIONS_DATABASE } from './src/data/questions.js';
@@ -35,7 +34,7 @@ import {
   attachGameSocketServer,
   shuffled,
 } from './src/server/gameSocketServer.js';
-import { parsePublicOrigins } from './src/server/socketGuards.js';
+import { parsePublicOrigins, safeTokenEquals } from './src/server/socketGuards.js';
 import {
   Question,
 } from './src/types.js';
@@ -129,14 +128,6 @@ const GENERATION_FAILED = 'La génération a échoué, réessayez.';
 
 function maxGenerationAttemptsPerRoom(): number {
   return 2 * MAX_CUSTOM_PACKS_PER_ROOM;
-}
-
-function safeTokenEquals(actual: string | undefined, expected: string): boolean {
-  if (!actual) return false;
-  const actualBuffer = Buffer.from(actual);
-  const expectedBuffer = Buffer.from(expected);
-  return actualBuffer.length === expectedBuffer.length
-    && timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 function samePackName(left: string, right: string): boolean {
