@@ -373,7 +373,8 @@ async function startServer() {
 
     // Vite filenames are content-hashed. Serve the precompressed variant and
     // cache it for a year; a future deployment gets a new filename.
-    app.get('/assets/*', (req, res, next) => {
+    // Express 5 (path-to-regexp 8) refuse le joker nu `*` : il se nomme.
+    app.get('/assets/{*asset}', (req, res, next) => {
       // Posé avant tout choix : la réponse dépend du codage accepté, y compris
       // quand on retombe sur le fichier d'origine. Sans cela, un cache partagé
       // pouvait resservir du Brotli à un client qui ne le lit pas.
@@ -411,10 +412,10 @@ async function startServer() {
     // Une route d'API inconnue, ou un fichier absent (`/server.cjs`, une
     // `.map`…), répond 404 au lieu de la page du jeu : un 200 laissait croire
     // que le fichier existait, et masquait les liens cassés.
-    app.all('/api/*', (_req, res) => {
+    app.all('/api/{*route}', (_req, res) => {
       res.status(404).json({ error: 'Ressource introuvable.' });
     });
-    app.get('*', (req, res) => {
+    app.get('/{*page}', (req, res) => {
       if (path.extname(req.path)) {
         res.status(404).type('text/plain; charset=utf-8').send('Fichier introuvable.');
         return;
