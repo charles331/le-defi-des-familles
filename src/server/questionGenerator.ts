@@ -304,7 +304,11 @@ export function createQuestionGenerator(
     };
   }
 
-  const ai = new GoogleGenAI({ apiKey: config.apiKey });
+  // Le SDK 3 vise par défaut l'API `v1`, où manquent les alias `*-latest`,
+  // une partie des modèles `-preview` qu'on peut glisser dans GEMINI_MODEL, et
+  // dont la sortie structurée (`responseSchema`) n'a jamais été éprouvée ici.
+  // On garde `v1beta`, celle que le générateur a toujours appelée.
+  const ai = new GoogleGenAI({ apiKey: config.apiKey, apiVersion: 'v1beta' });
   return {
     provider: config.provider,
     model: config.model,

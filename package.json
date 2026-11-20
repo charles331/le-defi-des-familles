@@ -18,7 +18,7 @@
     "score:fun": "node --import tsx scripts/score-fun.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.32.0",
+    "@google/genai": "^3.6.1",
     "@tailwindcss/vite": "^4.3.5",
     "@types/canvas-confetti": "^1.9.0",
     "@vitejs/plugin-react": "^5.2.0",
