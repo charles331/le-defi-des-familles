@@ -190,7 +190,9 @@ function dropOpaqueAlpha(image: DecodedPng): DecodedPng {
  */
 function filterRows(rows: Buffer[], stride: number, channels: number, type: number): Buffer {
   const scanlines: Buffer[] = [];
-  let previous = Buffer.alloc(stride);
+  // Annoté : `Buffer.alloc` renvoie un Buffer<ArrayBuffer>, plus étroit que les
+  // lignes reçues, et TypeScript 7 refuse alors `previous = row`.
+  let previous: Buffer = Buffer.alloc(stride);
 
   for (const row of rows) {
     const filtered = Buffer.alloc(stride + 1);
