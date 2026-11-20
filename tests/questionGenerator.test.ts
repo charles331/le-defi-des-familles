@@ -109,3 +109,28 @@ test('le générateur OpenAI envoie la bonne clé et retourne le tableau de cart
   assert.equal(capturedBody.model, 'gpt-test');
   assert.deepEqual(questions, [{ question: 'Question test' }]);
 });
+
+test('le générateur Gemini appelle v1beta avec la sortie structurée, malgré le défaut v1 du SDK 3', async () => {
+  // Le SDK passe par le fetch global, pas par celui qu'on injecte au générateur.
+  const realFetch = globalThis.fetch;
+  let capturedUrl = '';
+  let capturedBody: any;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    capturedUrl = input instanceof Request ? input.url : String(input);
+    capturedBody = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: JSON.stringify([{ question: 'Question test' }]) }] } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const generator = createQuestionGenerator({ GEMINI_API_KEY: 'gemini-secret', GEMINI_MODEL: 'gemini-test' });
+    const questions = await generator.generateBatch('Astérix', 1);
+
+    assert.match(capturedUrl, /^https:\/\/generativelanguage\.googleapis\.com\/v1beta\/models\/gemini-test:generateContent/);
+    assert.equal(capturedBody.generationConfig.responseMimeType, 'application/json');
+    assert.equal(capturedBody.generationConfig.responseSchema.type, 'ARRAY');
+    assert.deepEqual(questions, [{ question: 'Question test' }]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

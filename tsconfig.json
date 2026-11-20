@@ -1,6 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    // TypeScript 7 active `strict` par défaut. Le code n'a jamais été vérifié
+    // en mode strict — React n'a même pas de types installés et passe pour
+    // `any` — : on fige ici le comportement d'avant plutôt que de le changer
+    // en douce à l'occasion d'une montée de version.
+    "strict": false,
     "experimentalDecorators": true,
     "useDefineForClassFields": false,
     "module": "ESNext",
