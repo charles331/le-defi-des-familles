@@ -53,13 +53,19 @@ export function describeRecoveredSeat(name: string, wedgeCount: number): string 
  * préfère alors laisser l'organisateur trancher plutôt que de deviner et de
  * donner les camemberts de l'un à l'autre. Les joueurs du pass & play sont
  * exclus : ils partagent l'appareil de l'organisateur et ne se reconnectent pas.
+ *
+ * Le siège de l'organisateur l'est aussi : il ne se reprend qu'avec son jeton
+ * de session. Le reprendre au prénom, c'était devenir organisateur — et recevoir
+ * le jeton de génération des packs — en connaissant seulement le code du salon
+ * et un prénom (audit de sécurité, novembre 2026). Voir `seatRequests.ts`.
  */
 export function findAbandonedSeat(state: GameState, name: string): Player | null {
-  const wanted = normalizeSeatName(name || '');
+  const wanted = normalizeSeatName(typeof name === 'string' ? name : '');
   if (!wanted) return null;
 
   const matches = state.players.filter(player => (
     !player.isConnected
+    && !player.isHost
     && !player.id.startsWith('local_')
     && normalizeSeatName(player.name) === wanted
   ));

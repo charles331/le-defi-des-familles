@@ -1,8 +1,16 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
-import { mkdir, rename, writeFile } from 'fs/promises';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'fs';
+import { mkdir, open, rename, rm } from 'fs/promises';
 import { randomBytes } from 'crypto';
 import path from 'path';
 import { GameSettings, GameState, Player, Question } from './src/types.js';
+import {
+  isKnownCategory,
+  isPlainObject,
+  reviveStoredPack,
+  reviveStoredPlayer,
+  reviveStoredSettings,
+} from './src/server/inputValidation.js';
+import { normalizeRoomCode } from './src/server/roomCodes.js';
 
 /**
  * Persistance des parties sans base de données.
@@ -62,10 +70,18 @@ interface StoredFile {
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), '.data');
 const STORE_PATH = path.join(DATA_DIR, 'rooms.json');
-const TEMP_PATH = `${STORE_PATH}.tmp`;
+/**
+ * Un fichier temporaire par écriture. Un nom fixe se partageait entre
+ * l'écriture périodique et celle de l'arrêt (ou celle d'un second processus
+ * pendant un redéploiement) : l'une pouvait renommer le fichier que l'autre
+ * était en train d'écrire.
+ */
+const tempPath = (): string => `${STORE_PATH}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
 
 /** Une salle plus vieille que cela n'est pas rechargée : elle serait balayée. */
 const MAX_RESTORE_AGE_MS = 12 * 60 * 60 * 1000;
+/** Même plafond que `MAX_CUSTOM_PACKS_PER_ROOM` côté jeu. */
+const MAX_STORED_PACKS = 3;
 
 let lastWritten = '';
 let disabled = false;
@@ -125,8 +141,23 @@ export function saveRooms(rooms: Map<string, PersistableRoom>): void {
   void (async () => {
     try {
       await mkdir(DATA_DIR, { recursive: true });
-      await writeFile(TEMP_PATH, payload, 'utf8');
-      await rename(TEMP_PATH, STORE_PATH);
+      // `fsync` avant le `rename` : sans lui, une coupure de courant peut
+      // laisser un fichier renommé mais vide, le rename atteignant le disque
+      // avant les données.
+      const temp = tempPath();
+      try {
+        const handle = await open(temp, 'w');
+        try {
+          await handle.writeFile(payload, 'utf8');
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        await rename(temp, STORE_PATH);
+      } catch (error) {
+        await rm(temp, { force: true });
+        throw error;
+      }
       lastWritten = payload;
     } catch (error) {
       warnOnce(`Impossible d'écrire les parties dans ${STORE_PATH}`, error);
@@ -145,14 +176,21 @@ export function saveRooms(rooms: Map<string, PersistableRoom>): void {
  * À ce moment précis, il faut que l'écriture soit terminée avant de rendre la
  * main : c'est elle qui sauve la partie en cours lors d'un redéploiement.
  */
-function saveRoomsSync(rooms: Map<string, PersistableRoom>): void {
+export function saveRoomsSync(rooms: Map<string, PersistableRoom>): void {
   if (disabled) return;
   try {
     const payload = serialize(rooms);
     if (payload === lastWritten) return;
     mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(TEMP_PATH, payload, 'utf8');
-    renameSync(TEMP_PATH, STORE_PATH);
+    const temp = tempPath();
+    const fd = openSync(temp, 'w');
+    try {
+      writeSync(fd, payload, null, 'utf8');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, STORE_PATH);
     lastWritten = payload;
   } catch (error) {
     warnOnce(`Impossible d'écrire les parties dans ${STORE_PATH}`, error);
@@ -192,53 +230,138 @@ export function loadRooms(
 
   const now = Date.now();
   let skipped = 0;
+  let rejected = 0;
   for (const stored of parsed.rooms) {
-    if (!stored?.code || !stored.gameState) continue;
-    if (now - stored.lastActivityAt > MAX_RESTORE_AGE_MS) {
-      skipped += 1;
-      continue;
+    // Un salon illisible est écarté seul : avant, une seule donnée malformée —
+    // un prénom qui n'était pas une chaîne — faisait planter chaque démarrage,
+    // et toutes les parties en cours avec lui.
+    try {
+      const room = reviveStoredRoom(stored, questionsDatabase, shuffle, now);
+      if (room === 'expired') skipped += 1;
+      else if (room === null) rejected += 1;
+      else rooms.set(room.code, room);
+    } catch (error) {
+      rejected += 1;
+      console.warn(`⚠️  Salon sauvegardé illisible, il est écarté (${error instanceof Error ? error.message : error}).`);
     }
-
-    const customQuestions = (stored.gameState.customPacks ?? []).flatMap((pack) => pack.questions);
-    rooms.set(stored.code, {
-      code: stored.code,
-      hostSocketId: stored.hostSocketId,
-      generationToken: stored.generationToken || randomBytes(32).toString('base64url'),
-      reconnectTokens: new Map(Object.entries(stored.reconnectTokens ?? {})),
-      settings: {
-        ...stored.settings,
-        enableBonuses: stored.settings.enableBonuses ?? false,
-      },
-      createdAt: stored.createdAt,
-      lastActivityAt: stored.lastActivityAt,
-      // Les compteurs de grâce repartent à zéro : sans cela une salle rechargée
-      // serait balayée aussitôt, personne n'ayant encore eu le temps de revenir.
-      emptySince: now,
-      hostDisconnectedAt: now,
-      sockets: new Map(),
-      gameState: {
-        ...stored.gameState,
-        settings: {
-          ...stored.gameState.settings,
-          enableBonuses: stored.gameState.settings.enableBonuses ?? false,
-        },
-        players: stored.gameState.players.map((player) => ({
-          ...player,
-          bonuses: player.bonuses ?? {},
-          isConnected: false,
-        })),
-        questionsPool: shuffle([...customQuestions, ...questionsDatabase]),
-      },
-    });
   }
 
-  if (rooms.size > 0 || skipped > 0) {
+  if (rooms.size > 0 || skipped > 0 || rejected > 0) {
     console.log(
       `💾 ${rooms.size} partie(s) rechargée(s) depuis ${STORE_PATH}`
-        + (skipped > 0 ? `, ${skipped} trop ancienne(s) ignorée(s)` : ''),
+        + (skipped > 0 ? `, ${skipped} trop ancienne(s) ignorée(s)` : '')
+        + (rejected > 0 ? `, ${rejected} invalide(s) écartée(s)` : ''),
     );
   }
   return rooms;
+}
+
+const STORED_PHASES: readonly GameState['phase'][] = [
+  'lobby', 'first_player_roll', 'rolling', 'moving', 'question', 'evaluating', 'game_over',
+];
+
+/**
+ * Un salon relu du disque, revalidé avec les règles qui s'appliquent aux envois
+ * des clients (`src/server/inputValidation.ts`).
+ *
+ * Un joueur inutilisable fait écarter le salon entier : sans lui, les sièges, le
+ * tour et le tirage d'ouverture ne se correspondraient plus. Un pack illisible,
+ * lui, s'écarte seul — la partie peut se poursuivre sans ses cartes.
+ *
+ * Les joueurs reviennent marqués déconnectés : leurs sockets n'existent plus.
+ */
+export function reviveStoredRoom(
+  stored: unknown,
+  questionsDatabase: Question[],
+  shuffle: <T>(values: T[]) => T[],
+  now: number,
+): PersistableRoom | 'expired' | null {
+  if (!isPlainObject(stored) || !isPlainObject(stored.gameState)) return null;
+  const code = normalizeRoomCode(stored.code);
+  if (!code || typeof stored.hostSocketId !== 'string') return null;
+  const createdAt = typeof stored.createdAt === 'number' && Number.isFinite(stored.createdAt) ? stored.createdAt : now;
+  const lastActivityAt = typeof stored.lastActivityAt === 'number' && Number.isFinite(stored.lastActivityAt)
+    ? stored.lastActivityAt
+    : now;
+  if (now - lastActivityAt > MAX_RESTORE_AGE_MS) return 'expired';
+
+  const storedState = stored.gameState as Record<string, unknown> & Omit<GameState, 'questionsPool'>;
+  if (!Array.isArray(storedState.players)) return null;
+  const players: Player[] = [];
+  for (const raw of storedState.players) {
+    const player = reviveStoredPlayer(raw);
+    if (!player) return null;
+    players.push(player);
+  }
+
+  const customPacks = Array.isArray(storedState.customPacks)
+    ? storedState.customPacks
+      .map(reviveStoredPack)
+      .filter((pack): pack is NonNullable<typeof pack> => pack !== null)
+      .slice(0, MAX_STORED_PACKS)
+    : [];
+  const customQuestions = customPacks.flatMap((pack) => pack.questions);
+  const settings = reviveStoredSettings(stored.settings, code);
+
+  const reconnectTokens = new Map<string, string>();
+  if (isPlainObject(stored.reconnectTokens)) {
+    for (const [playerId, token] of Object.entries(stored.reconnectTokens)) {
+      if (typeof token === 'string' && token.length <= 200) reconnectTokens.set(playerId, token);
+    }
+  }
+
+  // Une carte en cours dont la forme ne tient plus est abandonnée : le tour
+  // repart du lancer plutôt que de planter à la réponse.
+  let phase = STORED_PHASES.includes(storedState.phase) ? storedState.phase : 'lobby';
+  let currentQuestion = storedState.currentQuestion ?? null;
+  if (currentQuestion !== null && (
+    !isPlainObject(currentQuestion)
+    || typeof currentQuestion.question !== 'string'
+    || !Array.isArray(currentQuestion.options)
+  )) {
+    currentQuestion = null;
+  }
+  if ((phase === 'question' || phase === 'evaluating') && !currentQuestion) phase = 'rolling';
+
+  const activePlayerIndex = Number.isInteger(storedState.activePlayerIndex)
+    && storedState.activePlayerIndex >= 0
+    && storedState.activePlayerIndex < Math.max(players.length, 1)
+    ? storedState.activePlayerIndex
+    : 0;
+
+  return {
+    code,
+    hostSocketId: stored.hostSocketId,
+    generationToken: typeof stored.generationToken === 'string' && stored.generationToken
+      ? stored.generationToken
+      : randomBytes(32).toString('base64url'),
+    reconnectTokens,
+    settings,
+    createdAt,
+    lastActivityAt,
+    // Les compteurs de grâce repartent à zéro : sans cela une salle rechargée
+    // serait balayée aussitôt, personne n'ayant encore eu le temps de revenir.
+    emptySince: now,
+    hostDisconnectedAt: now,
+    sockets: new Map(),
+    gameState: {
+      ...storedState,
+      roomCode: code,
+      phase,
+      currentQuestion,
+      activePlayerIndex,
+      settings,
+      players,
+      customPacks,
+      usedQuestionIds: Array.isArray(storedState.usedQuestionIds)
+        ? storedState.usedQuestionIds.filter((id): id is string => typeof id === 'string')
+        : [],
+      boardCategories: Array.isArray(storedState.boardCategories)
+        ? storedState.boardCategories.filter(isKnownCategory)
+        : undefined,
+      questionsPool: shuffle([...customQuestions, ...questionsDatabase]),
+    },
+  };
 }
 
 /**
