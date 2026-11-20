@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { after, before, test } from 'node:test';
 import { io as connect, Socket as ClientSocket } from 'socket.io-client';
 import { GameSocketServer, Room, SocketLimits, attachGameSocketServer } from '../src/server/gameSocketServer';
+import type { Question } from '../src/types';
 
 /**
  * Le serveur de jeu, éprouvé par de vrais clients socket.io.
@@ -427,5 +428,60 @@ test('un appareil ne rejoint pas deux fois la même table, ni deux tables à la 
   await joined;
   assert.ok(!room.sockets.has(guest.id!));
   assert.equal(room.gameState.players.length, 1);
+});
+
+/** Laura a la main, Charles — assis juste avant elle — lit la carte. */
+async function questionForLaura(question: Partial<Question>, startedAgoMs = 0) {
+  const table = await tableOfTwo();
+  // Laisse passer les mises à jour de l'arrivée de Laura avant de poser la carte.
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const { room } = table;
+  room.settings.isReaderMode = true;
+  room.settings.timerSeconds = 30;
+  room.gameState.phase = 'question';
+  room.gameState.activePlayerIndex = 1;
+  room.gameState.questionStartTime = Date.now() - startedAgoMs;
+  room.gameState.currentQuestion = {
+    id: 'q_test',
+    categoryId: 'histoire',
+    question: 'Quel navire a conduit les Pères pèlerins en Amérique ?',
+    options: [],
+    correctAnswerIndex: 0,
+    difficulty: 'ado',
+    ...question,
+  };
+  return table;
+}
+
+test('le joueur actif ne s’auto-valide pas une carte ouverte ; le lecteur, si', async () => {
+  const { host, guest, roomCode, room } = await questionForLaura({ format: 'open', answer: 'Le Mayflower' });
+  guest.emit('submit-answer', { roomCode, optionIndex: 0 });
+  await silence(host, 'game-state-update');
+  assert.equal(room.gameState.lastAnswerResult, null);
+
+  const judged = next(host, 'game-state-update');
+  host.emit('submit-answer', { roomCode, optionIndex: 0 });
+  await judged;
+  assert.equal(room.gameState.lastAnswerResult?.isCorrect, true);
+});
+
+test('le joueur actif peut toujours passer une carte ouverte', async () => {
+  const { host, guest, roomCode, room } = await questionForLaura({ format: 'open', answer: 'Le Mayflower' });
+  const passed = next(host, 'game-state-update');
+  guest.emit('submit-answer', { roomCode, optionIndex: -1 });
+  await passed;
+  assert.equal(room.gameState.lastAnswerResult?.isCorrect, false);
+});
+
+test('une bonne réponse arrivée après le minuteur compte comme un temps écoulé', async () => {
+  const { host, guest, roomCode, room } = await questionForLaura({
+    format: 'mcq',
+    options: ['Le Mayflower', 'La Santa Maria', 'Le Titanic', 'Le Bounty'],
+  }, 40_000);
+  const answered = next(host, 'game-state-update');
+  guest.emit('submit-answer', { roomCode, optionIndex: 0 });
+  await answered;
+  assert.equal(room.gameState.lastAnswerResult?.isCorrect, false);
+  assert.equal(room.gameState.lastAnswerResult?.selectedOption, -1);
 });
 

@@ -14,7 +14,8 @@ import {
   transferFirstPlayerRoll,
 } from './firstPlayerDraw';
 import { rollDie } from './diceThrow';
-import { createGameStateView } from './gameStateView';
+import { createGameStateView, isDesignatedReader } from './gameStateView';
+import { judgeAnswer } from './answerRules';
 import { describeRecoveredSeat, mergeSeatInto, normalizeSeatName } from './seats';
 import {
   MAX_SEAT_REQUESTS_PER_ROOM,
@@ -1494,8 +1495,23 @@ export function attachGameSocketServer(
       if (!Number.isInteger(data.optionIndex) || data.optionIndex < -1 || data.optionIndex > 3) return;
       if (room.gameState.activeQuestionBonus?.hiddenOptionIndexes.includes(data.optionIndex)) return;
 
+      // Carte ouverte jugée par le lecteur seul, minuteur appliqué ici et non
+      // plus seulement dans le navigateur (answerRules.ts).
+      const verdict = judgeAnswer({
+        question: room.gameState.currentQuestion,
+        optionIndex: data.optionIndex,
+        isReader: isDesignatedReader(room.gameState, socket.id, room.hostSocketId),
+        settings: room.settings,
+        questionStartTime: room.gameState.questionStartTime,
+        now: Date.now(),
+      });
+      if ('reason' in verdict) {
+        console.warn(`[Answer Rejected] ${socket.id} dans ${room.code} : ${verdict.reason}`);
+        return;
+      }
+
       const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
-      resolveAnswer(room.gameState, room.settings, board, data.optionIndex);
+      resolveAnswer(room.gameState, room.settings, board, verdict.optionIndex);
       emitGameState(room);
     });
 
