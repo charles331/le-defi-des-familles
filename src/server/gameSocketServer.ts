@@ -30,6 +30,7 @@ import {
   sanitizeThemeNames,
 } from './inputValidation';
 import { normalizeRoomCode } from './roomCodes';
+import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
 import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
 import { activeThemeKeys, pickQuestionForPlayer } from './questionSelection';
 import {
@@ -1228,9 +1229,19 @@ export function attachGameSocketServer(
     });
 
     // Send Emoji Reaction
-    on('send-emoji', (data: { roomCode: string; emoji: string }) => {
+    //
+    // Relayée à tout le salon, la réaction ne vient que d'un membre, n'est qu'un
+    // des emojis que l'interface propose, et pas plus d'une par seconde. Sans
+    // ces trois gardes, n'importe qui connaissant le code pouvait envoyer un
+    // objet à la place de l'emoji et faire planter le rendu de toute la table.
+    let lastReactionAt = 0;
+    on('send-emoji', (data: { roomCode: string; emoji: unknown }) => {
       const room = getRoom(data.roomCode);
-      if (!room) return;
+      if (!room || !room.sockets.has(socket.id)) return;
+      if (!isReactionEmoji(data.emoji)) return;
+      const now = Date.now();
+      if (now - lastReactionAt < REACTION_MIN_INTERVAL_MS) return;
+      lastReactionAt = now;
 
       const player = room.gameState.players.find(p => p.id === socket.id);
       io.to(room.code).emit('emoji-received', {

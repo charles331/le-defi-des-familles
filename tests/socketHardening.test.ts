@@ -173,6 +173,38 @@ test('un pack contenant une question null est refusé', async () => {
   assert.equal(pack.questions[0].themePack, 'Harry Potter');
 });
 
+async function tableOfTwo() {
+  const host = await client();
+  const { roomCode } = await createRoom(host, 'Charles');
+  const guest = await client();
+  const joined = next(guest, 'room-joined');
+  guest.emit('join-room', { roomCode, player: { name: 'Laura' } });
+  await joined;
+  return { host, guest, roomCode, room: rooms.get(roomCode)! };
+}
+
+test('une réaction ne se relaie qu’entre membres, depuis la liste, une par seconde', async () => {
+  const { host, guest, roomCode } = await tableOfTwo();
+  const outsider = await client();
+
+  // Un non-membre qui connaît le code ne parle pas au salon.
+  outsider.emit('send-emoji', { roomCode, emoji: '🔥' });
+  await silence(host, 'emoji-received');
+
+  // Un membre, mais avec un objet à la place de l'emoji.
+  guest.emit('send-emoji', { roomCode, emoji: { toString: null } });
+  guest.emit('send-emoji', { roomCode, emoji: '💩' });
+  await silence(host, 'emoji-received');
+
+  const received = next(host, 'emoji-received');
+  guest.emit('send-emoji', { roomCode, emoji: '👏' });
+  assert.equal((await received).emoji, '👏');
+
+  // La seconde, dans la même seconde, est ignorée.
+  guest.emit('send-emoji', { roomCode, emoji: '🎉' });
+  await silence(host, 'emoji-received');
+});
+
 test('en partie, un joueur ne change plus que son avatar', async () => {
   const host = await client();
   const { roomCode } = await createRoom(host, 'Charles', { isLocalMode: true });
