@@ -9,7 +9,7 @@ import { normalizeCategoryId } from './src/data/categories.js';
 import {
   normalize as normalizeText,
 } from './src/data/questionRules.js';
-import { checkStore, loadRooms, startRoomPersistence, saveRooms, ROOM_STORE_PATH } from './roomStore.js';
+import { checkStore, loadRooms, startRoomPersistence, saveRooms, saveRoomsSync, ROOM_STORE_PATH } from './roomStore.js';
 import {
   KnownFactIndex,
   answerKeyOf,
@@ -233,6 +233,26 @@ app.post('/api/generate-pack', async (req, res) => {
 // vivent dans `src/server/gameSocketServer.ts`.
 const rooms: Map<string, Room> = loadRooms(QUESTIONS_DATABASE, shuffled);
 attachGameSocketServer(httpServer, { rooms, persist: () => saveRooms(rooms) });
+
+// Dernier filet. Les handlers de socket.io attrapent déjà leurs propres
+// exceptions ; ce qui arrive encore ici est un bug ailleurs, et l'état du
+// processus n'est plus sûr. On écrit les parties tant qu'on le peut, puis on
+// s'arrête : Railway relance le service, et le rechargement revalide chaque
+// salon. Avant, le processus mourait sans rien écrire — trois secondes de
+// partie perdues pour toutes les tables.
+process.on('uncaughtException', (error) => {
+  console.error('❌ Exception non rattrapée, sauvegarde puis arrêt :', error);
+  try {
+    saveRoomsSync(rooms);
+  } finally {
+    process.exit(1);
+  }
+});
+// Une promesse rejetée sans gestionnaire ne compromet pas l'état : on la
+// journalise et on continue, au lieu du plantage par défaut de Node.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  Promesse rejetée sans gestionnaire :', reason);
+});
 
 
 // Vite & Static file serving

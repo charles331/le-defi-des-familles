@@ -3,8 +3,6 @@ import { randomBytes, timingSafeEqual } from 'crypto';
 import { Server, Socket } from 'socket.io';
 import { QUESTIONS_DATABASE } from '../data/questions';
 import { BOARD_CATEGORY_COUNT, buildBoard, resolveBoardCategories } from '../data/boards';
-import { CATEGORIES } from '../data/categories';
-import { QUESTION_TIMER_OPTIONS } from '../utils/questionTimer';
 import { advanceTurn, calculateMoves, removePlayerFromGame, resetGameForNewRound, resolveAnswer, togglePauseState } from './gameEngine';
 import {
   beginFirstPlayerDraw,
@@ -17,7 +15,21 @@ import {
 } from './firstPlayerDraw';
 import { rollDie } from './diceThrow';
 import { createGameStateView } from './gameStateView';
-import { describeRecoveredSeat, findAbandonedSeat, mergeSeatInto } from './seats';
+import { describeRecoveredSeat, findAbandonedSeat, mergeSeatInto, normalizeSeatName } from './seats';
+import {
+  MAX_ACTIVE_THEME_NAMES,
+  defaultSettings,
+  isPlainObject,
+  sanitizeAvatarId,
+  sanitizeColor,
+  sanitizeCustomPack,
+  sanitizeDifficulty,
+  sanitizePlayerName,
+  sanitizePlayerProfile,
+  sanitizeSettings,
+  sanitizeThemeNames,
+} from './inputValidation';
+import { normalizeRoomCode } from './roomCodes';
 import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
 import { activeThemeKeys, pickQuestionForPlayer } from './questionSelection';
 import {
@@ -28,11 +40,6 @@ import {
   useLeapBonus,
   wheelSlotFor,
 } from './bonuses';
-import {
-  DEFAULT_BONUS_MODE,
-  DEFAULT_QUESTION_TIMER_SECONDS,
-  DEFAULT_READER_MODE,
-} from '../config/gameSettings';
 import {
   BonusType,
   GameState,
@@ -105,59 +112,17 @@ const ROOM_MAX_AGE_MS = positiveDuration(process.env.ROOM_MAX_AGE_MS, 12 * 60 * 
 const ROOM_SWEEP_INTERVAL_MS = positiveDuration(process.env.ROOM_SWEEP_INTERVAL_MS, 30 * 1000);
 
 /**
- * Ne retient d'un envoi de réglages que ce qui est jouable.
+ * Taille maximale d'un message reçu, en octets.
  *
- * `update-settings` fusionnait le message du client tel quel dans les réglages du
- * salon. C'était l'entrée la plus permissive du serveur, et rien n'y était borné :
- * un nombre de camemberts au-delà des catégories du plateau rendait la partie
- * ingagnable, une durée de chrono négative cassait le décompte, et une catégorie
- * inconnue traversait jusqu'au plateau où le rendu la refusait. Aucune de ces
- * valeurs n'est atteignable depuis l'interface — c'est bien pour cela qu'un client
- * obsolète ou un salon repris du disque pouvait les produire sans qu'on le voie.
- *
- * Une clé absente reste absente : on ne réécrit jamais un réglage que l'hôte n'a
- * pas touché.
+ * Le défaut de socket.io est d'un mégaoctet : assez pour qu'un seul client
+ * envoie des chaînes géantes, que le serveur recopiait dans l'état puis
+ * renvoyait à chaque joueur du salon et resérialisait toutes les trois secondes.
+ * Le plus gros message légitime est un pack de soixante cartes ; un pack au
+ * plafond de chaque champ tient dans cette limite (vérifié par
+ * `tests/inputValidation.test.ts`).
  */
-export function sanitizeSettings(patch: Partial<GameSettings>): Partial<GameSettings> {
-  const clean: Partial<GameSettings> = {};
-  const bool = (value: unknown): boolean | undefined =>
-    typeof value === 'boolean' ? value : undefined;
+export const MAX_SOCKET_PAYLOAD_BYTES = 128 * 1024;
 
-  if (patch.boardType !== undefined && ['wheel', 'snake', 'star'].includes(patch.boardType)) {
-    clean.boardType = patch.boardType;
-  }
-  if (Array.isArray(patch.selectedCategories)) {
-    // Les identifiants inconnus tombent, les doublons aussi, et l'on ne garde
-    // jamais plus que les six places du plateau.
-    const vues: CategoryId[] = [];
-    for (const categoryId of patch.selectedCategories) {
-      if (!(categoryId in CATEGORIES) || vues.includes(categoryId)) continue;
-      if (vues.length >= BOARD_CATEGORY_COUNT) break;
-      vues.push(categoryId);
-    }
-    clean.selectedCategories = vues;
-  }
-  if (typeof patch.timerSeconds === 'number'
-    && (QUESTION_TIMER_OPTIONS as readonly number[]).includes(patch.timerSeconds)) {
-    clean.timerSeconds = patch.timerSeconds;
-  }
-  if (typeof patch.wedgesToWin === 'number'
-    && Number.isInteger(patch.wedgesToWin)
-    && patch.wedgesToWin >= 1
-    && patch.wedgesToWin <= BOARD_CATEGORY_COUNT) {
-    clean.wedgesToWin = patch.wedgesToWin;
-  }
-  if (Array.isArray(patch.customThemePackNames)) {
-    clean.customThemePackNames = patch.customThemePackNames
-      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
-      .slice(0, 12);
-  }
-  for (const key of ['isLocalMode', 'isReaderMode', 'enableLiveCamera', 'enableBonuses'] as const) {
-    const value = bool(patch[key]);
-    if (value !== undefined) clean[key] = value;
-  }
-  return clean;
-}
 export interface GameSocketServerOptions {
   /** Les salons, éventuellement rechargés du disque par l'appelant. */
   rooms: Map<string, Room>;
@@ -187,11 +152,15 @@ export function attachGameSocketServer(
     cors: {
       origin: '*',
       methods: ['GET', 'POST']
-    }
+    },
+    maxHttpBufferSize: MAX_SOCKET_PAYLOAD_BYTES,
   });
 
 
-  function getRoom(code: string): Room | undefined {
+  /** Le salon désigné par un code venu du réseau, quelle qu'en soit la forme. */
+  function getRoom(rawCode: unknown): Room | undefined {
+    const code = normalizeRoomCode(rawCode);
+    if (!code) return undefined;
     const room = rooms.get(code);
     if (room) room.lastActivityAt = Date.now();
     return room;
@@ -335,22 +304,48 @@ export function attachGameSocketServer(
   io.on('connection', (socket: Socket) => {
     console.log(`[Socket] Connexion: ${socket.id}`);
 
+    /**
+     * Enregistre un handler d'événement client, derrière deux garde-fous.
+     *
+     * Un message sans objet — `emit('create-room')` tout court, ou `null` — ne
+     * parvient jamais au handler. Et une exception levée dedans est journalisée
+     * au lieu de remonter : socket.io appelle les handlers hors de toute pile
+     * protégée, si bien qu'un seul `TypeError` sur un champ manquant tuait le
+     * processus, et toutes les parties en cours avec lui. L'audit l'a obtenu
+     * d'une ligne, sans même rejoindre de salon.
+     *
+     * Les types annoncés par les handlers ne sont qu'une promesse du client :
+     * chaque champ dont la forme compte est revérifié dans le handler.
+     */
+    function on<T extends object>(event: string, handler: (data: T) => void): void {
+      socket.on(event, (data: unknown) => {
+        if (!isPlainObject(data)) return;
+        try {
+          handler(data as T);
+        } catch (error) {
+          console.error(`[Socket] « ${event} » a échoué pour ${socket.id} :`, error);
+        }
+      });
+    }
+
     // Create Private Room
-    socket.on('create-room', (data: { player: Partial<Player>; settings: Partial<GameSettings> }) => {
+    on('create-room', (data: { player?: unknown; settings?: unknown }) => {
       leaveAllRoomsForSocket(socket.id, 'L’organisateur a créé un nouveau salon.');
       if (rooms.size >= MAX_ROOMS) {
         return socket.emit('error-msg', 'Trop de salons sont actifs. Réessayez dans quelques minutes.');
       }
 
       const roomCode = generateRoomCode();
-      const isLocal = data.settings?.isLocalMode || false;
+      const requestedSettings = sanitizeSettings(data.settings);
+      const isLocal = requestedSettings.isLocalMode === true;
+      const profile = sanitizePlayerProfile(data.player, { avatarId: 'lion', color: '#EF4444', difficulty: 'adulte' });
 
       const hostPlayer: Player = {
         id: socket.id,
-        name: data.player.name || 'Hôte Famille',
-        avatarId: data.player.avatarId || 'lion',
-        color: data.player.color || '#EF4444',
-        difficulty: data.player.difficulty || 'adulte',
+        name: profile.name ?? 'Hôte Famille',
+        avatarId: profile.avatarId,
+        color: profile.color,
+        difficulty: profile.difficulty,
         wedges: [],
         currentTileId: 0,
         isHost: true,
@@ -362,16 +357,14 @@ export function attachGameSocketServer(
         bonuses: {},
       };
 
+      // Mêmes règles qu'`update-settings` : ce chemin les contournait, et une
+      // sélection de catégories inventée entrait dans le salon dès sa création.
       const initialSettings: GameSettings = {
+        ...defaultSettings(roomCode, isLocal),
+        ...requestedSettings,
         roomCode,
-        boardType: data.settings.boardType || 'wheel',
-        selectedCategories: data.settings.selectedCategories || ['histoire', 'geographie', 'cinema', 'sciences', 'art', 'sports'],
-        timerSeconds: data.settings.timerSeconds ?? DEFAULT_QUESTION_TIMER_SECONDS,
-        wedgesToWin: data.settings.wedgesToWin || 6,
-        isLocalMode: isLocal,
-        isReaderMode: data.settings?.isReaderMode ?? DEFAULT_READER_MODE,
-        enableLiveCamera: data.settings?.enableLiveCamera ?? false,
-        enableBonuses: data.settings?.enableBonuses ?? DEFAULT_BONUS_MODE,
+        // Un salon neuf n'a encore aucun pack : aucun thème ne peut y être actif.
+        customThemePackNames: undefined,
       };
 
       const initialGameState: GameState = {
@@ -423,8 +416,8 @@ export function attachGameSocketServer(
     });
 
     // Reconnect Existing Session (on page refresh or disconnect recovery)
-    socket.on('reconnect-session', (data: { roomCode: string; playerId: string; sessionToken?: string }) => {
-      const code = (data.roomCode || '').toUpperCase().trim();
+    on('reconnect-session', (data: { roomCode: string; playerId: string; sessionToken?: string }) => {
+      const code = normalizeRoomCode(data.roomCode) ?? '';
       const room = getRoom(code);
 
       if (!room) {
@@ -453,27 +446,28 @@ export function attachGameSocketServer(
     });
 
     // Join Room
-    socket.on('join-room', (data: { roomCode: string; player: Partial<Player> }) => {
-      const code = (data.roomCode || '').toUpperCase().trim();
+    on('join-room', (data: { roomCode: unknown; player?: unknown }) => {
+      const code = normalizeRoomCode(data.roomCode) ?? '';
       const room = getRoom(code);
 
       if (!room) {
         return socket.emit('error-msg', 'Salon introuvable. Vérifiez le code de la salle privée.');
       }
+      const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
 
       // Quelqu'un qui revient avec son prénom reprend son siège au lieu d'en créer
       // un second. C'est le filet du jeton de session, qui ne survit pas au
       // changement de navigateur : sans lui, une coupure de réseau se soldait par un
       // doublon — un « Christelle » déconnecté avec quatre camemberts, un autre à
       // zéro — que rien ne permettait de réunir.
-      const abandonedSeat = findAbandonedSeat(room.gameState, data.player.name || '');
+      const abandonedSeat = findAbandonedSeat(room.gameState, profile.name ?? '');
       if (abandonedSeat) {
         const recoveredToken = randomBytes(32).toString('base64url');
         const previousSeatId = abandonedSeat.id;
         bindSeatToSocket(room, abandonedSeat, previousSeatId, socket, recoveredToken);
         // Elle peut avoir changé d'avis sur son avatar en revenant ; ses camemberts,
         // son pion et son niveau, eux, appartiennent à la partie en cours.
-        if (data.player.avatarId) abandonedSeat.avatarId = data.player.avatarId;
+        abandonedSeat.avatarId = sanitizeAvatarId((data.player as { avatarId?: unknown } | undefined)?.avatarId, abandonedSeat.avatarId);
         settleFirstPlayerDraw(room.gameState);
 
         socket.emit('room-joined', {
@@ -497,10 +491,10 @@ export function attachGameSocketServer(
       // Create new player in room
       const newPlayer: Player = {
         id: socket.id,
-        name: data.player.name || `Joueur ${room.gameState.players.length + 1}`,
-        avatarId: data.player.avatarId || 'fox',
-        color: data.player.color || '#3B82F6',
-        difficulty: data.player.difficulty || 'adulte',
+        name: profile.name ?? `Joueur ${room.gameState.players.length + 1}`,
+        avatarId: profile.avatarId,
+        color: profile.color,
+        difficulty: profile.difficulty,
         wedges: [],
         currentTileId: 0,
         isHost: false,
@@ -530,7 +524,7 @@ export function attachGameSocketServer(
     });
 
     // Local Pass & Play Add Player
-    socket.on('add-local-player', (data: { roomCode: string; player: Partial<Player> }) => {
+    on('add-local-player', (data: { roomCode: string; player?: unknown }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode) return;
       if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
@@ -538,15 +532,18 @@ export function attachGameSocketServer(
       }
 
       const usedColors = new Set(room.gameState.players.map(player => player.color.toLowerCase()));
-      const requestedColor = data.player.color?.toLowerCase();
-      const availableColor = PLAYER_COLORS.find(color => !usedColors.has(color.toLowerCase())) || data.player.color || '#10B981';
+      // Couleur « vide » en repli : seule une couleur réellement demandée, et
+      // valide, peut l'emporter sur la première couleur libre de la palette.
+      const profile = sanitizePlayerProfile(data.player, { avatarId: 'robot', color: '', difficulty: 'enfant' });
+      const requestedColor = profile.color.toLowerCase();
+      const availableColor = PLAYER_COLORS.find(color => !usedColors.has(color.toLowerCase())) || profile.color || '#10B981';
 
       const newPlayer: Player = {
         id: `local_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        name: data.player.name || `Joueur ${room.gameState.players.length + 1}`,
-        avatarId: data.player.avatarId || 'robot',
-        color: requestedColor && !usedColors.has(requestedColor) ? data.player.color! : availableColor,
-        difficulty: data.player.difficulty || 'enfant',
+        name: profile.name ?? `Joueur ${room.gameState.players.length + 1}`,
+        avatarId: profile.avatarId,
+        color: requestedColor && !usedColors.has(requestedColor) ? profile.color : availableColor,
+        difficulty: profile.difficulty,
         wedges: [],
         currentTileId: 0,
         isHost: false,
@@ -574,7 +571,7 @@ export function attachGameSocketServer(
      * salon pour tout le monde, ce qui est une autre décision et passe par
      * « Quitter ».
      */
-    socket.on('remove-player', (data: { roomCode: string; playerId: string }) => {
+    on('remove-player', (data: { roomCode: string; playerId: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
       if (!data.playerId || data.playerId === room.hostSocketId) return;
@@ -611,7 +608,7 @@ export function attachGameSocketServer(
      * C'est le siège d'origine qui l'emporte — il porte la partie déjà jouée — et
      * l'appareil du doublon qui en reprend les commandes.
      */
-    socket.on('merge-player', (data: { roomCode: string; sourcePlayerId: string; targetPlayerId: string }) => {
+    on('merge-player', (data: { roomCode: string; sourcePlayerId: string; targetPlayerId: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
 
@@ -654,16 +651,16 @@ export function attachGameSocketServer(
       console.log(`[Room] Fusion dans ${room.code} : ${duplicateName} rendu à son siège d'origine`);
     });
 
-    socket.on('remove-local-player', (data: { roomCode: string; playerId: string }) => {
+    on('remove-local-player', (data: { roomCode: string; playerId: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode || room.gameState.phase !== 'lobby') return;
-      if (!data.playerId?.startsWith('local_')) return;
+      if (typeof data.playerId !== 'string' || !data.playerId.startsWith('local_')) return;
 
       room.gameState.players = room.gameState.players.filter(player => player.id !== data.playerId);
       emitGameState(room);
     });
 
-    socket.on('toggle-ready', (data: { roomCode: string }) => {
+    on('toggle-ready', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.gameState.phase !== 'lobby' || room.settings.isLocalMode) return;
 
@@ -675,7 +672,7 @@ export function attachGameSocketServer(
     });
 
     // Update Settings (Host only)
-    socket.on('update-settings', (data: { roomCode: string; settings: Partial<GameSettings> }) => {
+    on('update-settings', (data: { roomCode: string; settings: Partial<GameSettings> }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
 
@@ -697,44 +694,71 @@ export function attachGameSocketServer(
     });
 
     // Update Player Profile (Avatar, Color, Name, Difficulty)
-    socket.on('update-player', (data: { roomCode: string; player: Partial<Player> }) => {
+    on('update-player', (data: { roomCode: string; player?: unknown }) => {
       const room = getRoom(data.roomCode);
-      if (!room) return;
+      if (!room || !isPlainObject(data.player)) return;
+      const update = data.player;
 
-      const requestedPlayer = room.gameState.players.find(pl => pl.id === data.player.id);
+      const requestedPlayer = room.gameState.players.find(pl => pl.id === update.id);
       const canEditRequestedLocalPlayer = room.hostSocketId === socket.id && requestedPlayer?.id.startsWith('local_');
       const p = room.gameState.players.find(pl => pl.id === socket.id) || (canEditRequestedLocalPlayer ? requestedPlayer : undefined);
-      if (p) {
-        if (data.player.name !== undefined) p.name = data.player.name;
-        if (data.player.avatarId) p.avatarId = data.player.avatarId;
-        if (data.player.color) p.color = data.player.color;
-        if (data.player.difficulty) p.difficulty = data.player.difficulty;
+      if (!p) return;
 
-        emitGameState(room);
+      // En partie, seul l'avatar se change encore. Le niveau choisit les cartes
+      // et le prénom identifie le siège — c'est par lui qu'on le reprend après
+      // une coupure : les changer en cours de route, c'était se donner des
+      // cartes enfant à quatre camemberts de la victoire, ou prendre le prénom
+      // d'un absent pour qu'on lui rende sa place.
+      const inLobby = room.gameState.phase === 'lobby';
+      p.avatarId = sanitizeAvatarId(update.avatarId, p.avatarId);
+      if (inLobby) {
+        p.color = sanitizeColor(update.color, p.color);
+        p.difficulty = sanitizeDifficulty(update.difficulty, p.difficulty);
+        if (typeof update.name === 'string') {
+          // Un champ vidé pendant la saisie reste vide : « Joueur N » le
+          // remplacera au lancement.
+          const name = sanitizePlayerName(update.name) ?? '';
+          const taken = name !== '' && room.gameState.players.some(other => (
+            other !== p && normalizeSeatName(other.name) === normalizeSeatName(name)
+          ));
+          if (taken) {
+            socket.emit('error-msg', 'Ce prénom est déjà pris à cette table.');
+          } else {
+            p.name = name;
+          }
+        }
       }
+
+      emitGameState(room);
     });
 
     // Add Custom AI Theme Pack
-    socket.on('add-custom-pack', (data: { roomCode: string; themeName: string; questions: Question[] }) => {
+    on('add-custom-pack', (data: { roomCode: string; themeName?: unknown; questions?: unknown }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
-      if (!Array.isArray(data.questions) || data.questions.length === 0 || data.questions.length > 60) {
-        return socket.emit('error-msg', 'Un pack doit contenir entre 1 et 60 questions.');
-      }
+
+      // Chaque carte est refaite par le serveur : identifiant neuf, thème du
+      // pack, forme contrôlée. Une carte `null` ou sans propositions faisait
+      // planter le tirage — et la sauvegarde la rejouait à chaque démarrage.
+      const stamp = `${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+      const pack = sanitizeCustomPack(data.themeName, data.questions, index => `custom_${stamp}_${index}`);
+      if ('error' in pack) return socket.emit('error-msg', pack.error);
+      const { themeName, questions } = pack;
+      const themeKey = themeName.toLowerCase();
 
       if (!room.gameState.customPacks) {
         room.gameState.customPacks = [];
       }
 
       const existingIndex = room.gameState.customPacks.findIndex(
-        p => p.name.toLowerCase().trim() === data.themeName.toLowerCase().trim()
+        p => p.name.toLowerCase().trim() === themeKey
       );
 
       const currentCustomQuestionCount = room.gameState.customPacks.reduce(
         (total, pack) => total + pack.questions.length,
         0
       );
-      if (currentCustomQuestionCount + data.questions.length > MAX_CUSTOM_QUESTIONS_PER_ROOM) {
+      if (currentCustomQuestionCount + questions.length > MAX_CUSTOM_QUESTIONS_PER_ROOM) {
         return socket.emit('error-msg', 'Ce salon a atteint sa limite de questions personnalisées.');
       }
       if (existingIndex < 0 && room.gameState.customPacks.length >= MAX_CUSTOM_PACKS_PER_ROOM) {
@@ -742,22 +766,25 @@ export function attachGameSocketServer(
       }
 
       if (existingIndex >= 0) {
-        room.gameState.customPacks[existingIndex].questions.push(...data.questions);
+        // Les cartes ajoutées portent le nom du pack existant, pas sa variante
+        // de casse : le tirage les rapproche par ce nom.
+        const existing = room.gameState.customPacks[existingIndex];
+        existing.questions.push(...questions.map(question => ({ ...question, themePack: existing.name })));
       } else {
         room.gameState.customPacks.push({
-          name: data.themeName,
-          questions: data.questions
+          name: themeName,
+          questions,
         });
       }
 
       // Le thème fraîchement généré rejoint les thèmes actifs, sans désactiver
       // les autres : la table peut jouer avec ses trois thèmes à la fois.
-      if (!activeThemeKeys(room.settings).has(data.themeName.toLowerCase().trim())) {
-        const activeNames = [
+      if (!activeThemeKeys(room.settings).has(themeKey)) {
+        const activeNames = sanitizeThemeNames([
           ...(room.settings.customThemePackNames ?? []),
           ...(room.settings.customThemePackName ? [room.settings.customThemePackName] : []),
-          data.themeName,
-        ];
+          themeName,
+        ], MAX_ACTIVE_THEME_NAMES);
         room.settings.customThemePackNames = activeNames;
         room.settings.customThemePackName = undefined;
         room.gameState.settings.customThemePackNames = activeNames;
@@ -765,10 +792,10 @@ export function attachGameSocketServer(
       }
 
       // Merge into room's active questions pool
-      room.gameState.questionsPool = [...data.questions, ...room.gameState.questionsPool];
+      room.gameState.questionsPool = [...questions, ...room.gameState.questionsPool];
 
       emitGameState(room);
-      console.log(`[Pack IA] ${data.questions.length} questions ajoutées pour "${data.themeName}" dans le salon ${data.roomCode}`);
+      console.log(`[Pack IA] ${questions.length} questions ajoutées pour "${themeName}" dans le salon ${room.code}`);
     });
 
     /**
@@ -779,7 +806,7 @@ export function attachGameSocketServer(
      * salon ». Ce n'est pas la même intention — on veut revenir régler la partie et
      * en relancer une, pas s'en aller.
      */
-    socket.on('return-to-lobby', (data: { roomCode: string }) => {
+    on('return-to-lobby', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase === 'lobby') return;
@@ -792,7 +819,7 @@ export function attachGameSocketServer(
     });
 
     // Start Game
-    socket.on('start-game', (data: { roomCode: string }) => {
+    on('start-game', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
 
@@ -882,7 +909,7 @@ export function attachGameSocketServer(
     }
 
     // Tirage du premier joueur : un seul lancer par joueur.
-    socket.on('roll-first-player', (data: { roomCode: string; playerId?: string }) => {
+    on('roll-first-player', (data: { roomCode: string; playerId?: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.gameState.phase !== 'first_player_roll') return;
       if (isPaused(room)) return;
@@ -903,7 +930,7 @@ export function attachGameSocketServer(
      * cette sortie de secours évite qu'un joueur parti chercher un verre bloque
      * indéfiniment le lancement de la partie.
      */
-    socket.on('end-first-player-roll', (data: { roomCode: string }) => {
+    on('end-first-player-roll', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase !== 'first_player_roll') return;
@@ -947,7 +974,7 @@ export function attachGameSocketServer(
      * À la reprise, `questionStartTime` est décalé de la durée de la pause : le
      * minuteur repart là où il s'était arrêté au lieu d'avoir expiré entre-temps.
      */
-    socket.on('toggle-pause', (data: { roomCode: string }) => {
+    on('toggle-pause', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase === 'lobby' || room.gameState.phase === 'game_over') return;
@@ -966,7 +993,7 @@ export function attachGameSocketServer(
     }
 
     // Roll Dice
-    socket.on('roll-dice', (data: {
+    on('roll-dice', (data: {
       roomCode: string;
       power?: number | null;
       /** Angle du geste, en degrés : il donne la direction du dé sur le plateau. */
@@ -1023,7 +1050,7 @@ export function attachGameSocketServer(
     });
 
     // Move Token to Tile
-    socket.on('move-player', (data: { roomCode: string; destinationTileId: number }) => {
+    on('move-player', (data: { roomCode: string; destinationTileId: number }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.gameState.phase !== 'moving') return;
       if (isPaused(room)) return;
@@ -1103,7 +1130,7 @@ export function attachGameSocketServer(
     // sans résultat —, comme pour le dé : c'est le serveur qui retient l'instant du
     // lancer, et le quartier d'arrivée était déjà décidé en arrivant sur la case.
     // Toute la table voit alors la même roue tourner et s'arrêter au même endroit.
-    socket.on('spin-surprise-wheel', (data: { roomCode: string }) => {
+    on('spin-surprise-wheel', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || isPaused(room)) return;
       if (room.gameState.phase !== 'question') return;
@@ -1125,7 +1152,7 @@ export function attachGameSocketServer(
     // table, une fois la roue arrêtée et le bonus révélé. Idempotent et réservé au
     // joueur actif — c'est lui qui donne le rythme, les autres écrans referment leur
     // roue en voyant le minuteur démarrer.
-    socket.on('start-question-timer', (data: { roomCode: string }) => {
+    on('start-question-timer', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || isPaused(room)) return;
       if (room.gameState.phase !== 'question') return;
@@ -1140,7 +1167,7 @@ export function attachGameSocketServer(
 
     // Use a stored question bonus. The server chooses the eliminated answers so
     // the correct answer never needs to be sent to the answering player's client.
-    socket.on('use-bonus', (data: { roomCode: string; bonusType: string }) => {
+    on('use-bonus', (data: { roomCode: string; bonusType: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || isPaused(room)) return;
       if (!BONUS_ROSTER.includes(data.bonusType as BonusType)) return;
@@ -1170,7 +1197,7 @@ export function attachGameSocketServer(
     });
 
     // Submit Question Answer
-    socket.on('submit-answer', (data: { roomCode: string; optionIndex: number }) => {
+    on('submit-answer', (data: { roomCode: string; optionIndex: number }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.gameState.phase !== 'question' || !room.gameState.currentQuestion) return;
       if (isPaused(room)) return;
@@ -1184,7 +1211,7 @@ export function attachGameSocketServer(
     });
 
     // Next Turn or Extra Turn
-    socket.on('next-turn', (data: { roomCode: string }) => {
+    on('next-turn', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || room.gameState.phase === 'game_over') return;
       if (isPaused(room)) return;
@@ -1201,12 +1228,12 @@ export function attachGameSocketServer(
     });
 
     // Send Emoji Reaction
-    socket.on('send-emoji', (data: { roomCode: string; emoji: string }) => {
+    on('send-emoji', (data: { roomCode: string; emoji: string }) => {
       const room = getRoom(data.roomCode);
       if (!room) return;
 
       const player = room.gameState.players.find(p => p.id === socket.id);
-      io.to(data.roomCode).emit('emoji-received', {
+      io.to(room.code).emit('emoji-received', {
         id: `${Date.now()}_${Math.random()}`,
         playerId: socket.id,
         playerName: player?.name || 'Joueur',
@@ -1227,16 +1254,16 @@ export function attachGameSocketServer(
       && room.gameState.phase === 'question'
       && resolveOnAirIds(room.gameState.players, room.gameState.activePlayerIndex).includes(socketId);
 
-    socket.on('webrtc-broadcaster-ready', (data: { roomCode: string }) => {
+    on('webrtc-broadcaster-ready', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || !isOnAir(room, socket.id)) return;
 
-      socket.to(data.roomCode).emit('webrtc-broadcaster-ready', {
+      socket.to(room.code).emit('webrtc-broadcaster-ready', {
         senderPlayerId: socket.id
       });
     });
 
-    socket.on('webrtc-viewer-ready', (data: { roomCode: string; targetPlayerId: string }) => {
+    on('webrtc-viewer-ready', (data: { roomCode: string; targetPlayerId: string }) => {
       const room = getRoom(data.roomCode);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!isOnAir(room, data.targetPlayerId)) return;
@@ -1249,7 +1276,7 @@ export function attachGameSocketServer(
       });
     });
 
-    socket.on('webrtc-offer', (data: { roomCode: string; targetPlayerId: string; offer: any }) => {
+    on('webrtc-offer', (data: { roomCode: string; targetPlayerId: string; offer: any }) => {
       const room = getRoom(data.roomCode);
       if (!room || !isOnAir(room, socket.id)) return;
       if (!room.sockets.has(data.targetPlayerId)) return;
@@ -1260,7 +1287,7 @@ export function attachGameSocketServer(
       });
     });
 
-    socket.on('webrtc-answer', (data: { roomCode: string; targetPlayerId: string; answer: any }) => {
+    on('webrtc-answer', (data: { roomCode: string; targetPlayerId: string; answer: any }) => {
       const room = getRoom(data.roomCode);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!isOnAir(room, data.targetPlayerId)) return;
@@ -1271,7 +1298,7 @@ export function attachGameSocketServer(
       });
     });
 
-    socket.on('webrtc-candidate', (data: {
+    on('webrtc-candidate', (data: {
       roomCode: string;
       targetPlayerId: string;
       publisherId: string;
@@ -1293,7 +1320,7 @@ export function attachGameSocketServer(
       });
     });
 
-    socket.on('webrtc-stop', (data: { roomCode: string }) => {
+    on('webrtc-stop', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode);
       // Any room member may announce that their own stream stopped: a sender can
       // only ever speak about itself here. Requiring the broadcaster role would
@@ -1302,13 +1329,13 @@ export function attachGameSocketServer(
       // connection until ICE eventually timed out.
       if (!room || !room.sockets.has(socket.id)) return;
 
-      socket.to(data.roomCode).emit('webrtc-stopped', {
+      socket.to(room.code).emit('webrtc-stopped', {
         senderPlayerId: socket.id
       });
     });
 
-    socket.on('leave-room', (data: { roomCode: string }) => {
-      const code = (data.roomCode || '').toUpperCase().trim();
+    on('leave-room', (data: { roomCode: string }) => {
+      const code = normalizeRoomCode(data.roomCode) ?? '';
       const room = getRoom(code);
       if (!room || !room.sockets.has(socket.id)) return;
 

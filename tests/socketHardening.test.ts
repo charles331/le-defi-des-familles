@@ -83,3 +83,107 @@ test('un salon se crée et se rejoint', async () => {
   assert.equal(rooms.get(roomCode)?.gameState.players.length, 2);
 });
 
+test('des paquets malformés ne tuent pas le serveur', async () => {
+  const attacker = await client();
+  const { roomCode } = await createRoom(attacker, 'Mallory');
+  // Chacun de ces envois faisait planter le processus avant le correctif
+  // (TypeError dans le handler, hors de toute pile protégée).
+  attacker.emit('create-room');
+  attacker.emit('create-room', null);
+  attacker.emit('create-room', 'FAM-ABCD');
+  attacker.emit('create-room', [1, 2]);
+  attacker.emit('create-room', { player: null, settings: 7 });
+  attacker.emit('reconnect-session', null);
+  attacker.emit('reconnect-session', { roomCode: { $ne: 1 }, playerId: [], sessionToken: {} });
+  attacker.emit('join-room', { roomCode });
+  attacker.emit('join-room', { roomCode: 42, player: 'x' });
+  attacker.emit('update-player', { roomCode });
+  attacker.emit('update-player', { roomCode, player: { name: 12, color: 1, difficulty: {} } });
+  attacker.emit('add-custom-pack', { roomCode, questions: [{}] });
+  attacker.emit('add-local-player', { roomCode, player: { color: 1 } });
+  attacker.emit('remove-local-player', { roomCode, playerId: 5 });
+  attacker.emit('submit-answer', null);
+  attacker.emit('send-emoji');
+
+  // Le serveur répond toujours, à un autre client comme à l'attaquant.
+  const witness = await client();
+  const created = await createRoom(witness, 'Témoin');
+  assert.match(created.roomCode, /^FAM-/);
+  const again = await createRoom(attacker, 'Mallory');
+  assert.match(again.roomCode, /^FAM-/);
+});
+
+test('un prénom qui n’est pas une chaîne n’entre pas dans le salon', async () => {
+  const host = await client();
+  const created = next(host, 'room-created');
+  host.emit('create-room', { player: { name: { toString: 'x' }, color: 1, avatarId: '<script>' }, settings: {} });
+  const { roomCode, player } = await created;
+  assert.equal(player.name, 'Hôte Famille');
+  assert.equal(player.color, '#EF4444');
+  assert.equal(player.avatarId, 'lion');
+
+  const guest = await client();
+  const joined = next(guest, 'room-joined');
+  guest.emit('join-room', { roomCode, player: { name: ['Laura'], difficulty: 'expert' } });
+  const payload = await joined;
+  assert.equal(typeof payload.player.name, 'string');
+  assert.equal(payload.player.difficulty, 'adulte');
+});
+
+test('create-room passe par sanitizeSettings', async () => {
+  const host = await client();
+  const created = next(host, 'room-created');
+  host.emit('create-room', {
+    player: { name: 'Charles' },
+    settings: { wedgesToWin: 99, timerSeconds: -5, selectedCategories: ['constructor'], boardType: 'piege' },
+  });
+  const { roomCode } = await created;
+  const settings = rooms.get(roomCode)!.settings;
+  assert.equal(settings.wedgesToWin, 6);
+  assert.equal(settings.timerSeconds, 60);
+  assert.equal(settings.boardType, 'wheel');
+  assert.deepEqual(settings.selectedCategories, []);
+});
+
+test('un pack contenant une question null est refusé', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host);
+  const refused = next(host, 'error-msg');
+  host.emit('add-custom-pack', { roomCode, themeName: 'Piège', questions: [null] });
+  assert.match(await refused, /invalide/);
+  assert.equal(rooms.get(roomCode)!.gameState.customPacks?.length ?? 0, 0);
+
+  const accepted = next(host, 'game-state-update');
+  host.emit('add-custom-pack', {
+    roomCode,
+    themeName: 'Harry Potter',
+    questions: [{
+      id: 'q_choisi_par_le_client',
+      categoryId: 'cinema',
+      question: 'Quel sorcier porte une cicatrice en forme d’éclair ?',
+      options: ['Harry', 'Ron', 'Drago', 'Neville'],
+      correctAnswerIndex: 0,
+      difficulty: 'ado',
+    }],
+  });
+  await accepted;
+  const pack = rooms.get(roomCode)!.gameState.customPacks![0];
+  assert.equal(pack.questions.length, 1);
+  assert.notEqual(pack.questions[0].id, 'q_choisi_par_le_client');
+  assert.equal(pack.questions[0].themePack, 'Harry Potter');
+});
+
+test('en partie, un joueur ne change plus que son avatar', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host, 'Charles', { isLocalMode: true });
+  const room = rooms.get(roomCode)!;
+  room.gameState.phase = 'rolling';
+  const updated = next(host, 'game-state-update');
+  host.emit('update-player', { roomCode, player: { name: 'Autre', difficulty: 'enfant', avatarId: 'owl' } });
+  await updated;
+  const me = room.gameState.players[0];
+  assert.equal(me.name, 'Charles');
+  assert.equal(me.difficulty, 'adulte');
+  assert.equal(me.avatarId, 'owl');
+});
+

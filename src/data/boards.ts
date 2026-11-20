@@ -48,7 +48,9 @@ export function resolveBoardCategories(
     // n'existe pas dans `CATEGORIES` fait planter le rendu du plateau — mesuré,
     // « Cannot read properties of undefined (reading 'color') ». Un salon repris
     // du disque après le retrait d'une catégorie suffirait à l'obtenir.
-    if (!(categoryId in CATEGORIES)) continue;
+    // `Object.hasOwn` et non `in` : `in` remonte la chaîne des prototypes, et
+    // « constructor » ou « toString » passaient pour des catégories.
+    if (!Object.hasOwn(CATEGORIES, categoryId)) continue;
     if (!retenues.includes(categoryId)) retenues.push(categoryId);
   }
   for (const secours of DEFAULT_BOARD_CATEGORIES) {
