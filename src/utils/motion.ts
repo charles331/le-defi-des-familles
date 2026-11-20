@@ -72,8 +72,35 @@ export function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-function parseHex(hex: string): { r: number; g: number; b: number } {
-  const clean = hex.replace('#', '');
+/**
+ * Couleur de repli d'un pion dont la couleur reçue n'est pas un hexadécimal
+ * valide : un ardoise neutre, lisible sur le plateau sans imiter une catégorie.
+ */
+export const FALLBACK_PLAYER_COLOR = '#64748B';
+
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+/**
+ * Couleur sûre à interpoler dans une chaîne CSS.
+ *
+ * La couleur d'un joueur vient du réseau : c'est lui qui la choisit, et elle
+ * finit recopiée dans des `linear-gradient(...)` vus par toute la table. Une
+ * valeur comme `red 0%,red 100%),url(https://…),linear-gradient(red` refermait
+ * le dégradé et faisait charger une image externe chez chaque joueur — donc
+ * leur adresse IP chez un inconnu. Le serveur valide aussi, mais le client ne
+ * doit pas dépendre de lui pour ne pas fabriquer de CSS hostile : on n'accepte
+ * que `#rgb` et `#rrggbb`, et tout le reste retombe sur `fallback`.
+ */
+export function safeCssColor(value: unknown, fallback: string = FALLBACK_PLAYER_COLOR): string {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return HEX_COLOR.test(trimmed) ? trimmed.toLowerCase() : fallback;
+}
+
+function parseHex(hex: unknown): { r: number; g: number; b: number } {
+  // Passe par `safeCssColor` : une couleur qui n'est pas une chaîne faisait
+  // planter `hex.replace`, et le pion entier disparaissait avec son composant.
+  const clean = safeCssColor(hex).slice(1);
   const full =
     clean.length === 3
       ? clean
