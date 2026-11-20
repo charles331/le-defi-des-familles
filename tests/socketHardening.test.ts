@@ -309,3 +309,123 @@ test('un appel refusé d’un inconnu ne rafraîchit pas le salon', async () => 
   assert.ok(room.lastActivityAt > 1);
 });
 
+/** Attend que le serveur ait vu partir un appareil. */
+async function until(condition: () => boolean, timeoutMs = 1500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition jamais remplie');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+/** Une partie lancée où Christelle vient de perdre le réseau avec quatre camemberts. */
+async function tableWithLostSeat() {
+  const { host, guest, roomCode, room } = await tableOfTwo();
+  const christelle = await client();
+  const joined = next(christelle, 'room-joined');
+  christelle.emit('join-room', { roomCode, player: { name: 'Christelle' } });
+  await joined;
+  room.gameState.phase = 'rolling';
+  const seat = room.gameState.players.find(player => player.name === 'Christelle')!;
+  seat.wedges = ['histoire', 'art', 'sports', 'cinema'];
+  christelle.disconnect();
+  await until(() => !seat.isConnected);
+  return { host, guest, roomCode, room, seat };
+}
+
+test('un intrus ne reprend pas le siège de l’organisateur par son prénom', async () => {
+  const { host, roomCode, room } = await tableOfTwo();
+  room.gameState.phase = 'rolling';
+  host.disconnect();
+  await until(() => !room.gameState.players[0].isConnected);
+
+  const intruder = await client();
+  const refused = next(intruder, 'error-msg');
+  intruder.on('room-joined', () => assert.fail('l’intrus a obtenu une place'));
+  intruder.emit('join-room', { roomCode, player: { name: 'charles' } });
+  assert.match(await refused, /organisateur/);
+  assert.equal(room.hostSocketId, room.gameState.players[0].id);
+  assert.ok(!room.sockets.has(intruder.id!));
+});
+
+test('organisateur présent : reprendre une place se demande, et s’obtient s’il accepte', async () => {
+  const { host, roomCode, room, seat } = await tableWithLostSeat();
+  const returning = await client();
+  const askedHost = next(host, 'seat-requests');
+  const pending = next(returning, 'seat-request-pending');
+  returning.emit('join-room', { roomCode, player: { name: 'christelle' } });
+
+  assert.equal((await pending).kind, 'reclaim');
+  const requests = await askedHost;
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].name, 'Christelle');
+  assert.equal(requests[0].wedgeCount, 4);
+  // Rien n'est rendu tant que l'organisateur n'a pas répondu.
+  assert.equal(seat.isConnected, false);
+
+  const joined = next(returning, 'room-joined');
+  host.emit('answer-seat-request', { roomCode, requestId: requests[0].id, accept: true });
+  const payload = await joined;
+  assert.equal(payload.player.wedges.length, 4);
+  assert.equal(payload.generationToken, undefined);
+  assert.equal(seat.id, returning.id);
+  assert.ok(room.sockets.has(returning.id!));
+});
+
+test('organisateur présent : une demande refusée est refusée', async () => {
+  const { host, roomCode, seat } = await tableWithLostSeat();
+  const intruder = await client();
+  const asked = next(host, 'seat-requests');
+  intruder.emit('join-room', { roomCode, player: { name: 'Christelle' } });
+  const [request] = await asked;
+
+  const refused = next(intruder, 'seat-request-refused');
+  host.emit('answer-seat-request', { roomCode, requestId: request.id, accept: false });
+  assert.match((await refused).message, /pas accepté/);
+  assert.equal(seat.isConnected, false);
+});
+
+test('organisateur présent : un nouveau venu en pleine partie attend son accord', async () => {
+  const { host, roomCode, room } = await tableOfTwo();
+  room.gameState.phase = 'rolling';
+  const newcomer = await client();
+  const asked = next(host, 'seat-requests');
+  const pending = next(newcomer, 'seat-request-pending');
+  newcomer.emit('join-room', { roomCode, player: { name: 'Thomas' } });
+  assert.equal((await pending).kind, 'join');
+  const [request] = await asked;
+  assert.equal(room.gameState.players.length, 2);
+
+  const joined = next(newcomer, 'room-joined');
+  host.emit('answer-seat-request', { roomCode, requestId: request.id, accept: true });
+  assert.equal((await joined).player.name, 'Thomas');
+  assert.equal(room.gameState.players.length, 3);
+});
+
+test('organisateur absent : une place ordinaire se reprend encore toute seule', async () => {
+  const { host, roomCode, room, seat } = await tableWithLostSeat();
+  host.disconnect();
+  await until(() => !room.sockets.has(room.hostSocketId));
+  const returning = await client();
+  const joined = next(returning, 'room-joined');
+  returning.emit('join-room', { roomCode, player: { name: 'Christelle' } });
+  assert.equal((await joined).player.wedges.length, 4);
+  assert.equal(seat.isConnected, true);
+});
+
+test('un appareil ne rejoint pas deux fois la même table, ni deux tables à la fois', async () => {
+  const { guest, roomCode, room } = await tableOfTwo();
+  const refused = next(guest, 'error-msg');
+  guest.emit('join-room', { roomCode, player: { name: 'Laura bis' } });
+  assert.match(await refused, /déjà à cette table/);
+  assert.equal(room.gameState.players.length, 2);
+
+  const otherHost = await client();
+  const other = await createRoom(otherHost, 'Paul');
+  const joined = next(guest, 'room-joined');
+  guest.emit('join-room', { roomCode: other.roomCode, player: { name: 'Laura' } });
+  await joined;
+  assert.ok(!room.sockets.has(guest.id!));
+  assert.equal(room.gameState.players.length, 1);
+});
+

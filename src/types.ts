@@ -273,6 +273,20 @@ export interface GameState {
   pausedAt?: number | null;
 }
 
+/**
+ * Une demande d'entrée soumise à l'organisateur (`src/server/seatRequests.ts`) :
+ * quelqu'un qui reprend une place au prénom, ou qui arrive en cours de partie.
+ */
+export interface SeatRequestView {
+  id: string;
+  kind: 'reclaim' | 'join';
+  name: string;
+  avatarId: string;
+  color: string;
+  /** Camemberts du siège repris, pour que l'organisateur sache ce qu'il rend. */
+  wedgeCount: number;
+}
+
 export interface EmojiReaction {
   id: string;
   playerId: string;

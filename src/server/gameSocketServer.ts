@@ -15,7 +15,14 @@ import {
 } from './firstPlayerDraw';
 import { rollDie } from './diceThrow';
 import { createGameStateView } from './gameStateView';
-import { describeRecoveredSeat, findAbandonedSeat, mergeSeatInto, normalizeSeatName } from './seats';
+import { describeRecoveredSeat, mergeSeatInto, normalizeSeatName } from './seats';
+import {
+  MAX_SEAT_REQUESTS_PER_ROOM,
+  SEAT_REQUEST_TTL_MS,
+  SeatRequest,
+  decideArrival,
+  describeSeatRequest,
+} from './seatRequests';
 import {
   MAX_ACTIVE_THEME_NAMES,
   defaultSettings,
@@ -87,6 +94,8 @@ export interface Room {
    * quota de salons par foyer. Absente d'un salon rechargé du disque.
    */
   creatorKey?: string;
+  /** Demandes d’entrée en attente de l’organisateur ; jamais sauvegardées. */
+  seatRequests?: SeatRequest[];
 }
 
 /** Mélange de Fisher-Yates, partagé par le démarrage de partie et la reprise. */
@@ -256,6 +265,7 @@ export function attachGameSocketServer(
     const room = rooms.get(code);
     if (!room) return false;
 
+    refuseAllSeatRequests(room, 'Le salon a été fermé.');
     io.to(code).emit('room-closed', { reason });
     io.in(code).socketsLeave(code);
     room.sockets.clear();
@@ -363,6 +373,112 @@ export function attachGameSocketServer(
     }
   }, ROOM_SWEEP_INTERVAL_MS);
   roomSweep.unref();
+
+  /**
+   * Rend un siège abandonné à l'appareil qui revient : reprise automatique en
+   * l'absence de l'organisateur, ou acceptée par lui. Ses camemberts, son pion
+   * et son niveau appartiennent à la partie ; seul l'avatar peut changer.
+   */
+  function reclaimSeat(room: Room, seat: Player, socket: Socket, avatarId: string): void {
+    const recoveredToken = randomBytes(32).toString('base64url');
+    bindSeatToSocket(room, seat, seat.id, socket, recoveredToken);
+    if (avatarId) seat.avatarId = avatarId;
+    settleFirstPlayerDraw(room.gameState);
+
+    socket.emit('room-joined', {
+      roomCode: room.code,
+      player: seat,
+      gameState: gameStateFor(room, socket.id),
+      sessionToken: recoveredToken,
+    });
+    room.gameState.lastTurnEventMessage = describeRecoveredSeat(seat.name, seat.wedges.length);
+    emitGameState(room);
+    persist();
+    console.log(`[Room] ${seat.name} a retrouvé son siège dans ${room.code}`);
+  }
+
+  /** Assied un nouveau joueur, au centre du plateau et sans camembert. */
+  function admitNewPlayer(
+    room: Room,
+    socket: Socket,
+    profile: { name: string | null; avatarId: string; color: string; difficulty: Player['difficulty'] },
+  ): void {
+    const newPlayer: Player = {
+      id: socket.id,
+      name: profile.name ?? `Joueur ${room.gameState.players.length + 1}`,
+      avatarId: profile.avatarId,
+      color: profile.color,
+      difficulty: profile.difficulty,
+      wedges: [],
+      currentTileId: 0,
+      isHost: false,
+      isReady: false,
+      score: 0,
+      correctAnswersCount: 0,
+      totalAnswersCount: 0,
+      isConnected: true,
+      bonuses: {},
+    };
+
+    room.sockets.set(socket.id, newPlayer);
+    const sessionToken = randomBytes(32).toString('base64url');
+    room.reconnectTokens.set(socket.id, sessionToken);
+    room.gameState.players.push(newPlayer);
+    room.emptySince = null;
+    room.lastActivityAt = Date.now();
+    socket.join(room.code);
+
+    socket.emit('room-joined', {
+      roomCode: room.code,
+      player: newPlayer,
+      gameState: gameStateFor(room, socket.id),
+      sessionToken,
+    });
+    emitGameState(room);
+    console.log(`[Room] ${newPlayer.name} a rejoint le salon ${room.code}`);
+  }
+
+  // --- Demandes d'entrée soumises à l'organisateur (seatRequests.ts) ---
+  // Elles ne sont pas sauvegardées : elles désignent des connexions, qu'un
+  // redémarrage coupe de toute façon.
+  const seatRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function seatRequestsOf(room: Room): SeatRequest[] {
+    if (!room.seatRequests) room.seatRequests = [];
+    return room.seatRequests;
+  }
+
+  /** L'organisateur reçoit toujours la liste entière : rien à recoller côté client. */
+  function emitSeatRequests(room: Room): void {
+    io.to(room.hostSocketId).emit(
+      'seat-requests',
+      seatRequestsOf(room).map(request => describeSeatRequest(request, room.gameState)),
+    );
+  }
+
+  /** Retire une demande ; avec `refusal`, le demandeur apprend pourquoi. */
+  function dropSeatRequest(room: Room, requestId: string, refusal?: string): void {
+    const requests = seatRequestsOf(room);
+    const index = requests.findIndex(request => request.id === requestId);
+    if (index < 0) return;
+    const [request] = requests.splice(index, 1);
+    clearTimeout(seatRequestTimers.get(request.id));
+    seatRequestTimers.delete(request.id);
+    if (refusal) io.to(request.socketId).emit('seat-request-refused', { message: refusal });
+    emitSeatRequests(room);
+  }
+
+  function cancelSeatRequestsOf(socketId: string): void {
+    for (const room of rooms.values()) {
+      for (const request of [...(room.seatRequests ?? [])]) {
+        if (request.socketId === socketId) dropSeatRequest(room, request.id);
+      }
+    }
+  }
+
+  function refuseAllSeatRequests(room: Room, refusal: string): void {
+    for (const request of [...(room.seatRequests ?? [])]) dropSeatRequest(room, request.id, refusal);
+  }
 
   // Socket.IO Connection Handler
   io.on('connection', (socket: Socket) => {
@@ -544,6 +660,13 @@ export function attachGameSocketServer(
       if (!player || !expectedSessionToken || !safeTokenEquals(data.sessionToken, expectedSessionToken)) {
         return socket.emit('reconnect-failed', { message: 'Joueur non trouvé dans ce salon.' });
       }
+      // Une connexion ne tient qu'un siège : déjà assise ici sous un autre
+      // joueur, elle n'en prend pas un second.
+      if (room.sockets.has(socket.id) && socket.id !== player.id) return;
+
+      // Une connexion ne siège que dans un salon à la fois.
+      cancelSeatRequestsOf(socket.id);
+      leaveAllRoomsForSocket(socket.id, 'L’organisateur a rejoint un autre salon.');
 
       // Le lancer du tirage suit le joueur : il n'a pas à relancer après un
       // simple rafraîchissement de page.
@@ -556,6 +679,7 @@ export function attachGameSocketServer(
         generationToken: player.isHost ? room.generationToken : undefined,
         sessionToken: expectedSessionToken,
       });
+      if (player.isHost) emitSeatRequests(room);
       emitGameState(room);
       console.log(`[Room] ${player.name} s'est reconnecté avec succès à ${code}`);
     });
@@ -570,75 +694,122 @@ export function attachGameSocketServer(
         if (recordUnknownRoomCode()) return;
         return socket.emit('error-msg', 'Salon introuvable. Vérifiez le code de la salle privée.');
       }
+      // Rejoindre deux fois créait un second joueur au même identifiant de
+      // socket — douze, en insistant — que plus rien ne départageait.
+      if (room.sockets.has(socket.id)) {
+        return socket.emit('error-msg', 'Vous êtes déjà à cette table.');
+      }
+
       const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
+      // Pour une reprise, l'avatar ne change que s'il a vraiment été choisi.
+      const chosenAvatar = sanitizeAvatarId(isPlainObject(data.player) ? data.player.avatarId : undefined, '');
+      // Une nouvelle demande remplace la précédente, où qu'elle attende.
+      cancelSeatRequestsOf(socket.id);
 
       // Quelqu'un qui revient avec son prénom reprend son siège au lieu d'en créer
       // un second. C'est le filet du jeton de session, qui ne survit pas au
       // changement de navigateur : sans lui, une coupure de réseau se soldait par un
       // doublon — un « Christelle » déconnecté avec quatre camemberts, un autre à
-      // zéro — que rien ne permettait de réunir.
-      const abandonedSeat = findAbandonedSeat(room.gameState, profile.name ?? '');
-      if (abandonedSeat) {
-        const recoveredToken = randomBytes(32).toString('base64url');
-        const previousSeatId = abandonedSeat.id;
-        bindSeatToSocket(room, abandonedSeat, previousSeatId, socket, recoveredToken);
-        // Elle peut avoir changé d'avis sur son avatar en revenant ; ses camemberts,
-        // son pion et son niveau, eux, appartiennent à la partie en cours.
-        abandonedSeat.avatarId = sanitizeAvatarId((data.player as { avatarId?: unknown } | undefined)?.avatarId, abandonedSeat.avatarId);
-        settleFirstPlayerDraw(room.gameState);
+      // zéro — que rien ne permettait de réunir. Mais un prénom ne prouve rien :
+      // quand l'organisateur est là, c'est lui qui reconnaît la personne
+      // (`decideArrival`, dans seatRequests.ts).
+      const decision = decideArrival(room.gameState, profile.name, {
+        hostSeatId: room.hostSocketId,
+        hostConnected: room.sockets.has(room.hostSocketId),
+      });
 
-        socket.emit('room-joined', {
-          roomCode: code,
-          player: abandonedSeat,
-          gameState: gameStateFor(room, socket.id),
-          generationToken: abandonedSeat.isHost ? room.generationToken : undefined,
-          sessionToken: recoveredToken,
-        });
-        room.gameState.lastTurnEventMessage = describeRecoveredSeat(abandonedSeat.name, abandonedSeat.wedges.length);
-        emitGameState(room);
-        persist();
-        console.log(`[Room] ${abandonedSeat.name} a retrouvé son siège dans ${code}`);
+      if (decision.kind === 'refuse') {
+        return socket.emit('error-msg', decision.message);
+      }
+      if ((decision.kind === 'join' || decision.kind === 'ask-join')
+        && room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
+        return socket.emit('error-msg', 'Ce salon a atteint sa limite de joueurs.');
+      }
+
+      if (decision.kind === 'reclaim') {
+        leaveAllRoomsForSocket(socket.id, 'L’organisateur a rejoint un autre salon.');
+        reclaimSeat(room, decision.seat, socket, chosenAvatar);
+        return;
+      }
+      if (decision.kind === 'join') {
+        leaveAllRoomsForSocket(socket.id, 'L’organisateur a rejoint un autre salon.');
+        admitNewPlayer(room, socket, profile);
+        return;
+      }
+
+      const requests = seatRequestsOf(room);
+      if (requests.length >= MAX_SEAT_REQUESTS_PER_ROOM) {
+        return socket.emit('error-msg', 'L’organisateur a déjà plusieurs demandes en attente. Réessayez dans un instant.');
+      }
+      const request: SeatRequest = {
+        id: randomBytes(9).toString('base64url'),
+        socketId: socket.id,
+        kind: decision.kind === 'ask-reclaim' ? 'reclaim' : 'join',
+        seatId: decision.kind === 'ask-reclaim' ? decision.seat.id : null,
+        name: decision.kind === 'ask-reclaim'
+          ? decision.seat.name
+          : profile.name ?? `Joueur ${room.gameState.players.length + 1}`,
+        avatarId: chosenAvatar || profile.avatarId,
+        color: profile.color,
+        difficulty: profile.difficulty,
+        createdAt: Date.now(),
+      };
+      requests.push(request);
+      const timer = setTimeout(() => {
+        dropSeatRequest(room, request.id, 'L’organisateur n’a pas répondu. Réessayez quand il sera disponible.');
+      }, SEAT_REQUEST_TTL_MS);
+      timer.unref();
+      seatRequestTimers.set(request.id, timer);
+
+      socket.emit('seat-request-pending', { roomCode: room.code, name: request.name, kind: request.kind });
+      emitSeatRequests(room);
+      console.log(`[Room] ${request.name} demande à ${request.kind === 'reclaim' ? 'reprendre sa place' : 'rejoindre la partie'} dans ${room.code}`);
+    });
+
+    // L'organisateur accepte ou refuse une demande d'entrée.
+    on('answer-seat-request', (data: { roomCode: string; requestId: unknown; accept: unknown }) => {
+      const room = getRoom(data.roomCode, socket.id);
+      if (!room || room.hostSocketId !== socket.id) return;
+      const request = seatRequestsOf(room).find(candidate => candidate.id === data.requestId);
+      if (!request) return;
+      dropSeatRequest(room, request.id);
+
+      const requester = io.sockets.sockets.get(request.socketId);
+      if (!requester || room.sockets.has(requester.id)) return;
+      if (data.accept !== true) {
+        requester.emit('seat-request-refused', { message: 'L’organisateur n’a pas accepté votre demande.' });
+        return;
+      }
+
+      if (request.kind === 'reclaim') {
+        // Le siège peut avoir été repris entre-temps, par son jeton ou par une
+        // fusion : on ne le rend jamais à deux personnes.
+        const seat = room.gameState.players.find(player => player.id === request.seatId);
+        if (!seat || seat.isConnected || seat.isHost) {
+          requester.emit('seat-request-refused', { message: 'Cette place a été reprise entre-temps.' });
+          return;
+        }
+        leaveAllRoomsForSocket(requester.id, 'L’organisateur a rejoint un autre salon.');
+        reclaimSeat(room, seat, requester, request.avatarId);
         return;
       }
 
       if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
-        return socket.emit('error-msg', 'Ce salon a atteint sa limite de joueurs.');
+        requester.emit('seat-request-refused', { message: 'Ce salon a atteint sa limite de joueurs.' });
+        return;
       }
+      const recheck = decideArrival(room.gameState, request.name, { hostSeatId: room.hostSocketId, hostConnected: true });
+      if (recheck.kind === 'refuse') {
+        requester.emit('seat-request-refused', { message: recheck.message });
+        return;
+      }
+      leaveAllRoomsForSocket(requester.id, 'L’organisateur a rejoint un autre salon.');
+      admitNewPlayer(room, requester, request);
+    });
 
-      // Create new player in room
-      const newPlayer: Player = {
-        id: socket.id,
-        name: profile.name ?? `Joueur ${room.gameState.players.length + 1}`,
-        avatarId: profile.avatarId,
-        color: profile.color,
-        difficulty: profile.difficulty,
-        wedges: [],
-        currentTileId: 0,
-        isHost: false,
-        isReady: false,
-        score: 0,
-        correctAnswersCount: 0,
-        totalAnswersCount: 0,
-        isConnected: true,
-        bonuses: {},
-      };
-
-      room.sockets.set(socket.id, newPlayer);
-      const sessionToken = randomBytes(32).toString('base64url');
-      room.reconnectTokens.set(socket.id, sessionToken);
-      room.gameState.players.push(newPlayer);
-      room.emptySince = null;
-      room.lastActivityAt = Date.now();
-      socket.join(code);
-
-      socket.emit('room-joined', {
-        roomCode: code,
-        player: newPlayer,
-        gameState: gameStateFor(room, socket.id),
-        sessionToken,
-      });
-      emitGameState(room);
-      console.log(`[Room] ${newPlayer.name} a rejoint le salon ${code}`);
+    // Le demandeur renonce à attendre.
+    on('cancel-seat-request', () => {
+      cancelSeatRequestsOf(socket.id);
     });
 
     // Local Pass & Play Add Player
@@ -1482,7 +1653,8 @@ export function attachGameSocketServer(
     // Disconnect
     socket.on('disconnect', () => {
       console.log(`[Socket] Déconnexion: ${socket.id}`);
-      for (const [code, room] of rooms.entries()) {
+      cancelSeatRequestsOf(socket.id);
+      for (const room of rooms.values()) {
         if (room.sockets.has(socket.id)) {
           room.sockets.delete(socket.id);
           const p = room.gameState.players.find(pl => pl.id === socket.id);
@@ -1495,6 +1667,9 @@ export function attachGameSocketServer(
 
           if (room.hostSocketId === socket.id) {
             room.hostDisconnectedAt = Date.now();
+            // Plus personne pour répondre aux demandes : qu'ils réessaient, la
+            // reprise d'une place redevient automatique en son absence.
+            refuseAllSeatRequests(room, 'L’organisateur vient de perdre la connexion. Réessayez dans un instant.');
           }
           room.emptySince = room.sockets.size === 0 ? Date.now() : null;
 
@@ -1507,6 +1682,7 @@ export function attachGameSocketServer(
     io,
     close: () => new Promise<void>((resolve) => {
       clearInterval(roomSweep);
+      for (const timer of seatRequestTimers.values()) clearTimeout(timer);
       io.close(() => resolve());
     }),
   };

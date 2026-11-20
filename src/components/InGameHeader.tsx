@@ -335,8 +335,9 @@ export const InGameHeader: React.FC<InGameHeaderProps> = ({
                 Inviter quelqu’un maintenant
               </button>
               <p className="px-1 text-[10px] leading-snug text-slate-400">
-                Un joueur peut rejoindre la partie en cours avec ce lien : il démarre
-                au centre du plateau, sans camembert, et joue au tour suivant.
+                Un joueur peut rejoindre la partie en cours avec ce lien, une fois
+                que vous l’avez accepté : il démarre au centre du plateau, sans
+                camembert, et joue au tour suivant.
               </p>
               <button
                 onClick={() => setShowPlayersDrawer(false)}

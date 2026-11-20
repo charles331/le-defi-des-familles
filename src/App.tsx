@@ -7,8 +7,10 @@ import {
   Player,
   EmojiReaction,
   CategoryId,
-  Question
+  Question,
+  SeatRequestView
 } from './types';
+import { SeatRequestBanner, SeatRequestWaiting } from './components/SeatRequests';
 import { BOARD_PRESETS } from './data/boards';
 import { Lobby } from './components/Lobby';
 import { InGameHeader } from './components/InGameHeader';
@@ -43,6 +45,10 @@ export default function App() {
   const [emojiEvent, setEmojiEvent] = useState<EmojiReaction | null>(null);
   const [showQuestionModal, setShowQuestionModal] = useState<boolean>(false);
   const [generationToken, setGenerationToken] = useState<string>('');
+  // Demandes d'entrée : celles que l'organisateur doit trancher, et celle que
+  // cet appareil attend (voir src/server/seatRequests.ts).
+  const [seatRequests, setSeatRequests] = useState<SeatRequestView[]>([]);
+  const [pendingSeatRequest, setPendingSeatRequest] = useState<{ roomCode: string; name: string; kind: 'reclaim' | 'join' } | null>(null);
   // Le verdict du tirage d'ouverture reste affiché après la bascule en « rolling »,
   // le temps que la table voie qui commence et pourquoi.
   const [showDrawResult, setShowDrawResult] = useState<boolean>(false);
@@ -134,6 +140,7 @@ export default function App() {
     });
 
     newSocket.on('room-joined', (data: { roomCode: string; player: Player; gameState: GameState; generationToken?: string; sessionToken?: string }) => {
+      setPendingSeatRequest(null);
       setGameState(data.gameState);
       setGenerationToken(data.generationToken ?? '');
       if (data.player?.id) setCurrentUserId(data.player.id);
@@ -165,6 +172,7 @@ export default function App() {
       clearSession();
       setGameState(null);
       setGenerationToken('');
+      setSeatRequests([]);
       setCurrentUserId(newSocket.id || '');
       setShowQuestionModal(false);
       setEmojiEvent(null);
@@ -175,10 +183,31 @@ export default function App() {
       clearSession();
       setGameState(null);
       setGenerationToken('');
+      setSeatRequests([]);
       setCurrentUserId(newSocket.id || '');
       setShowQuestionModal(false);
       setEmojiEvent(null);
       setErrorMessage(null);
+    });
+
+    newSocket.on('seat-requests', (requests: SeatRequestView[]) => {
+      setSeatRequests(Array.isArray(requests) ? requests : []);
+    });
+
+    newSocket.on('seat-request-pending', (pending: { roomCode: string; name: string; kind: 'reclaim' | 'join' }) => {
+      setErrorMessage(null);
+      setPendingSeatRequest(pending);
+    });
+
+    newSocket.on('seat-request-refused', (data?: { message?: string }) => {
+      setPendingSeatRequest(null);
+      setErrorMessage(data?.message || 'L’organisateur n’a pas accepté votre demande.');
+    });
+
+    // Une connexion perdue emporte la demande avec elle, côté serveur.
+    newSocket.on('disconnect', () => {
+      setPendingSeatRequest(null);
+      setSeatRequests([]);
     });
 
     newSocket.on('emoji-received', (emojiData: EmojiReaction) => {
@@ -366,12 +395,36 @@ export default function App() {
     setErrorMessage(null);
     setEmojiEvent(null);
     setShowQuestionModal(false);
+    setSeatRequests([]);
   };
+
+  const handleAnswerSeatRequest = (requestId: string, accept: boolean) => {
+    if (socket && gameState) {
+      socket.emit('answer-seat-request', { roomCode: gameState.roomCode, requestId, accept });
+    }
+    // Retirée tout de suite à l'écran ; la liste du serveur suit.
+    setSeatRequests(requests => requests.filter(request => request.id !== requestId));
+  };
+
+  const handleCancelSeatRequest = () => {
+    socket?.emit('cancel-seat-request', {});
+    setPendingSeatRequest(null);
+  };
+
+  // Au-dessus de tous les écrans : une demande peut arriver au salon comme en
+  // pleine partie, et l'attente commence avant d'avoir un état de partie.
+  const seatRequestLayer = (
+    <>
+      <SeatRequestBanner requests={seatRequests} onAnswer={handleAnswerSeatRequest} />
+      <SeatRequestWaiting pending={pendingSeatRequest} onCancel={handleCancelSeatRequest} />
+    </>
+  );
 
   // Render Lobby if not in active game or in lobby phase
   if (!gameState || gameState.phase === 'lobby') {
     return (
       <div className="min-h-dvh bg-slate-950 text-slate-100 flex flex-col justify-between selection:bg-amber-500 selection:text-slate-950">
+        {seatRequestLayer}
         <Lobby
           gameState={gameState}
           currentUserId={currentUserId}
@@ -400,6 +453,7 @@ export default function App() {
   if (gameState.phase === 'first_player_roll' || showDrawResult) {
     return (
       <div className="min-h-dvh bg-slate-950 text-slate-100 flex flex-col">
+        {seatRequestLayer}
         <InGameHeader
           gameState={gameState}
           onLeaveGame={handleLeaveGame}
@@ -439,6 +493,7 @@ export default function App() {
 
   const gameContent = (
     <div className="min-h-dvh bg-slate-950 text-slate-100 flex flex-col justify-between select-none">
+      {seatRequestLayer}
       {/* Top Header Controls */}
       <InGameHeader
         gameState={gameState}
