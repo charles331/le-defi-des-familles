@@ -19,12 +19,14 @@ import { judgeAnswer } from './answerRules';
 import { describeRecoveredSeat, mergeSeatInto, normalizeSeatName } from './seats';
 import {
   REFUSED_RECENTLY,
-  SEAT_REFUSAL_COOLDOWN_MS,
+  recordRefusal,
+  refusedUntil,
   SEAT_REQUEST_TTL_MS,
   SeatRequest,
   admitSeatRequest,
   decideArrival,
   describeSeatRequest,
+  type SeatRefusals,
 } from './seatRequests';
 import {
   defaultSettings,
@@ -97,7 +99,7 @@ export interface Room {
   /** Demandes d’entrée en attente de l’organisateur ; jamais sauvegardées. */
   seatRequests?: SeatRequest[];
   /** Adresses éconduites par l’organisateur, et jusqu’à quand. */
-  seatRefusals?: Map<string, number>;
+  seatRefusals?: SeatRefusals;
 }
 
 /** Mélange de Fisher-Yates, partagé par le démarrage de partie et la reprise. */
@@ -172,6 +174,13 @@ export interface SocketLimits {
    */
   candidateBurst: number;
   candidatesPerSecond: number;
+  /**
+   * Connexions ouvertes en même temps depuis une même adresse. Les seaux
+   * ci-dessus sont par connexion : sans ce plafond, ouvrir N connexions donnait
+   * N fois le débit. Une maison ou une école derrière une même box reste
+   * largement en dessous.
+   */
+  maxConnectionsPerAddress: number;
 }
 
 export const DEFAULT_SOCKET_LIMITS: SocketLimits = {
@@ -182,7 +191,10 @@ export const DEFAULT_SOCKET_LIMITS: SocketLimits = {
   eventsPerSecond: 20,
   candidateBurst: 300,
   candidatesPerSecond: 100,
+  maxConnectionsPerAddress: 24,
 };
+
+const CODES_BLOCKED = 'Trop de codes de salon inconnus. Vérifiez le code et réessayez dans une minute.';
 
 const CODE_FAILURE_WINDOW_MS = 60 * 1000;
 
@@ -409,7 +421,9 @@ export function attachGameSocketServer(
       wedges: [],
       currentTileId: 0,
       isHost: false,
-      isReady: false,
+      // Admis en cours de partie, il n'a jamais vu le bouton « Prêt » : sans
+      // cela, « Rejouer » restait refusé à toute la table.
+      isReady: room.gameState.phase !== 'lobby',
       score: 0,
       correctAnswersCount: 0,
       totalAnswersCount: 0,
@@ -478,6 +492,23 @@ export function attachGameSocketServer(
   }
 
   // Socket.IO Connection Handler
+  const connectionsByAddress = new Map<string, number>();
+  io.use((socket, next) => {
+    const address = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for']);
+    const open = connectionsByAddress.get(address) ?? 0;
+    if (open >= limits.maxConnectionsPerAddress) {
+      console.warn(`[Socket] Connexion refusée : ${address} en a déjà ${open} ouvertes.`);
+      return next(new Error('Trop de connexions depuis votre réseau.'));
+    }
+    connectionsByAddress.set(address, open + 1);
+    socket.on('disconnect', () => {
+      const left = (connectionsByAddress.get(address) ?? 1) - 1;
+      if (left > 0) connectionsByAddress.set(address, left);
+      else connectionsByAddress.delete(address);
+    });
+    next();
+  });
+
   io.on('connection', (socket: Socket) => {
     console.log(`[Socket] Connexion: ${socket.id}`);
     const addressOfClient = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for']);
@@ -513,12 +544,18 @@ export function attachGameSocketServer(
       const addressBlocked = codeFailuresByAddress.record(addressOfClient, now);
       if (!socketBlocked && !addressBlocked) return false;
       console.warn(`[Socket] ${socket.id} (${addressOfClient}) déconnecté : trop de codes de salon inexistants.`);
-      socket.emit('error-msg', 'Trop de codes de salon inconnus. Vérifiez le code et réessayez dans une minute.');
+      socket.emit('error-msg', CODES_BLOCKED);
       socket.disconnect(true);
       return true;
     }
 
-    /** Une adresse déjà bloquée ne peut plus rien essayer, même depuis une connexion neuve. */
+    /**
+     * Une adresse déjà bloquée ne peut plus rien essayer, même depuis une
+     * connexion neuve. Elle est prévenue sans qu'un échec de plus soit compté :
+     * chaque rechargement de page prolongeait sinon le blocage d'une minute, et
+     * la déconnexion forcée coupait la reconnexion automatique d'un joueur
+     * légitime de la même maison.
+     */
     function isAddressBlocked(): boolean {
       return codeFailuresByAddress.isBlocked(addressOfClient, Date.now());
     }
@@ -643,7 +680,7 @@ export function attachGameSocketServer(
 
     // Reconnect Existing Session (on page refresh or disconnect recovery)
     on('reconnect-session', (data: { roomCode: string; playerId: string; sessionToken?: string }) => {
-      if (isAddressBlocked()) return void recordUnknownRoomCode();
+      if (isAddressBlocked()) return void socket.emit('error-msg', CODES_BLOCKED);
       const code = normalizeRoomCode(data.roomCode) ?? '';
       const room = getRoom(code, socket.id);
 
@@ -660,6 +697,17 @@ export function attachGameSocketServer(
       // Une connexion ne tient qu'un siège : déjà assise ici sous un autre
       // joueur, elle n'en prend pas un second.
       if (room.sockets.has(socket.id) && socket.id !== player.id) return;
+      // Déjà assise sur ce siège, la connexion n'a qu'à recevoir l'état : la
+      // faire quitter ses salons d'abord fermait celui de l'organisateur.
+      if (socket.id === player.id && room.sockets.has(socket.id)) {
+        return socket.emit('room-joined', {
+          roomCode: code,
+          player,
+          gameState: gameStateFor(room, socket.id),
+          generationToken: player.isHost ? room.generationToken : undefined,
+          sessionToken: expectedSessionToken,
+        });
+      }
 
       // Une connexion ne siège que dans un salon à la fois.
       cancelSeatRequestsOf(socket.id);
@@ -683,7 +731,7 @@ export function attachGameSocketServer(
 
     // Join Room
     on('join-room', (data: { roomCode: unknown; player?: unknown }) => {
-      if (isAddressBlocked()) return void recordUnknownRoomCode();
+      if (isAddressBlocked()) return void socket.emit('error-msg', CODES_BLOCKED);
       const code = normalizeRoomCode(data.roomCode) ?? '';
       const room = getRoom(code, socket.id);
 
@@ -696,14 +744,14 @@ export function attachGameSocketServer(
       if (room.sockets.has(socket.id)) {
         return socket.emit('error-msg', 'Vous êtes déjà à cette table.');
       }
-      // Refusée par l'organisateur il y a peu, l'adresse ne revient pas
+      const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
+      // Refusée par l'organisateur il y a peu, la personne ne revient pas
       // aussitôt — ni par une demande, ni par la reprise automatique qui
       // s'ouvrirait si l'organisateur perdait le réseau entre-temps.
-      if ((room.seatRefusals?.get(addressOfClient) ?? 0) > Date.now()) {
+      const refusal = refusedUntil(room.seatRefusals, addressOfClient, profile.name ?? '');
+      if ((refusal ?? 0) > Date.now()) {
         return socket.emit('error-msg', REFUSED_RECENTLY);
       }
-
-      const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
       // Pour une reprise, l'avatar ne change que s'il a vraiment été choisi.
       const chosenAvatar = sanitizeAvatarId(isPlainObject(data.player) ? data.player.avatarId : undefined, '');
       // Une nouvelle demande remplace la précédente, où qu'elle attende.
@@ -744,7 +792,7 @@ export function attachGameSocketServer(
       const admission = admitSeatRequest(
         requests,
         { socketId: socket.id, addressKey: addressOfClient },
-        room.seatRefusals?.get(addressOfClient),
+        refusal,
         Date.now(),
       );
       if ('message' in admission) return socket.emit('error-msg', admission.message);
@@ -783,12 +831,10 @@ export function attachGameSocketServer(
       dropSeatRequest(room, request.id);
 
       if (data.accept !== true) {
-        // Le refus vaut pour l'adresse : sans ce délai, l'intrus éconduit
-        // redéposait sa demande dans la seconde, sous un autre prénom.
+        // Le refus vaut surtout pour ce prénom, un peu pour l'adresse
+        // (`recordRefusal`, dans seatRequests.ts).
         if (!room.seatRefusals) room.seatRefusals = new Map();
-        const now = Date.now();
-        for (const [address, until] of room.seatRefusals) if (until <= now) room.seatRefusals.delete(address);
-        room.seatRefusals.set(request.addressKey, now + SEAT_REFUSAL_COOLDOWN_MS);
+        recordRefusal(room.seatRefusals, request.addressKey, request.name, Date.now());
       }
       const requester = io.sockets.sockets.get(request.socketId);
       if (!requester || room.sockets.has(requester.id)) return;
@@ -1307,10 +1353,12 @@ export function attachGameSocketServer(
         return;
       }
 
-      // Guardrail: Destination tile must be one of the calculated possible moves
-      if (room.gameState.possibleMoves.length > 0 && !room.gameState.possibleMoves.includes(data.destinationTileId)) {
-        console.warn(`[Move Safety] Tile ${data.destinationTileId} not in possibleMoves, redirecting to:`, room.gameState.possibleMoves[0]);
-        data.destinationTileId = room.gameState.possibleMoves[0];
+      // La destination est l'une des cases calculées par le serveur, ou rien :
+      // une case hors liste était redirigée vers la première, et une liste vide
+      // laissait passer n'importe quelle case du plateau.
+      if (!room.gameState.possibleMoves.includes(data.destinationTileId)) {
+        console.warn(`[Move Rejected] Case ${String(data.destinationTileId).slice(0, 20)} hors des déplacements possibles`);
+        return;
       }
 
       // La case se vérifie avant d'y poser le pion : sans destination calculée,

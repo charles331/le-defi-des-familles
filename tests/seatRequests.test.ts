@@ -5,6 +5,7 @@ import {
   NAME_TAKEN_REFUSAL,
   QUEUE_FULL,
   REFUSED_RECENTLY,
+  ADDRESS_REFUSAL_COOLDOWN_MS,
   SEAT_REFUSAL_COOLDOWN_MS,
   SEAT_REQUEST_TTL_MS,
   SeatRequest,
@@ -13,6 +14,8 @@ import {
   decideArrival,
   describeSeatRequest,
   isExpired,
+  recordRefusal,
+  refusedUntil,
 } from '../src/server/seatRequests';
 import { findAbandonedSeat } from '../src/server/seats';
 import { createGameState, createPlayer } from './fixtures';
@@ -94,8 +97,8 @@ function pending(socketId: string, addressKey: string, createdAt = 0): SeatReque
 
 test('une même adresse ne remplit pas la file à elle seule', () => {
   // L'attaquant ouvre autant de connexions qu'il veut, depuis la même box.
-  const queue = [pending('a1', '203.0.113.9'), pending('a2', '203.0.113.9')];
-  assert.deepEqual(admitSeatRequest(queue, { socketId: 'a3', addressKey: '203.0.113.9' }, undefined, 1), {
+  const queue = [pending('a1', '203.0.113.9'), pending('a2', '203.0.113.9'), pending('a3', '203.0.113.9')];
+  assert.deepEqual(admitSeatRequest(queue, { socketId: 'a4', addressKey: '203.0.113.9' }, undefined, 1), {
     ok: false, message: TOO_MANY_FROM_ADDRESS,
   });
   // La famille, ailleurs, dépose toujours la sienne.
@@ -121,4 +124,23 @@ test('après un refus, l’adresse attend avant de redemander', () => {
     ok: false, message: REFUSED_RECENTLY,
   });
   assert.deepEqual(admitSeatRequest([], { socketId: 'x', addressKey: 'a' }, until, until), { ok: true });
+});
+
+test('trois enfants qui reviennent ensemble sur le même Wi-Fi passent tous', () => {
+  const queue = [pending('k1', '198.51.100.4'), pending('k2', '198.51.100.4')];
+  assert.deepEqual(admitSeatRequest(queue, { socketId: 'k3', addressKey: '198.51.100.4' }, undefined, 1), { ok: true });
+});
+
+test('un refus pèse sur le prénom refusé, à peine sur le reste de la maison', () => {
+  const refusals = new Map<string, number>();
+  recordRefusal(refusals, '198.51.100.4', 'Christelle', 0);
+  // Le même prénom attend trois minutes, quelle que soit la casse.
+  assert.equal(refusedUntil(refusals, '198.51.100.4', 'christelle'), SEAT_REFUSAL_COOLDOWN_MS);
+  // Un autre prénom de la même maison, trente secondes seulement…
+  assert.equal(refusedUntil(refusals, '198.51.100.4', 'Thomas'), ADDRESS_REFUSAL_COOLDOWN_MS);
+  // … et une autre maison, rien du tout.
+  assert.equal(refusedUntil(refusals, '203.0.113.9', 'Christelle'), undefined);
+  // Les refus échus s'oublient au refus suivant.
+  recordRefusal(refusals, '203.0.113.9', 'Mallory', SEAT_REFUSAL_COOLDOWN_MS + 1);
+  assert.equal(refusedUntil(refusals, '198.51.100.4', 'Christelle'), undefined);
 });

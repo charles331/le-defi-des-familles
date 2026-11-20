@@ -227,8 +227,11 @@ export function reviveStoredPlayer(raw: unknown): Player | null {
   // Le prénom relu n'est pas tronqué en silence : s'il dépasse, il n'a pas été
   // écrit par ce serveur.
   const id = storedId(raw.id);
-  const name = sanitizePlayerName(raw.name);
-  if (!id || !name) return null;
+  // Un prénom vide, ce serveur l'écrit lui-même : un champ effacé au salon
+  // reste vide jusqu'au lancement (`update-player`). Le refuser écartait le
+  // salon entier au premier redéploiement.
+  const name = raw.name === '' ? '' : sanitizePlayerName(raw.name);
+  if (!id || name === null) return null;
 
   const wedges = Array.isArray(raw.wedges) ? raw.wedges.filter(isKnownCategory) : [];
   const bonuses: Player['bonuses'] = {};

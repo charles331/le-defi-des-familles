@@ -245,3 +245,11 @@ test('une carte en cours devenue illisible ramène le tour au lancer', () => {
   assert.equal(room.gameState.phase, 'rolling');
   assert.equal(room.gameState.currentQuestion, null);
 });
+
+test('un prénom effacé au salon ne fait pas perdre le salon au redémarrage', () => {
+  // `update-player` garde un champ vidé tel quel jusqu'au lancement ; la
+  // sauvegarde l'écrit, la relecture doit l'accepter.
+  const player = reviveStoredPlayer({ ...createPlayer('Christelle'), name: '' });
+  assert.ok(player);
+  assert.equal(player.name, '');
+});

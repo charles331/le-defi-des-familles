@@ -96,14 +96,49 @@ export const SEAT_REQUEST_TTL_MS = 2 * 60 * 1000;
 export const MAX_SEAT_REQUESTS_PER_ROOM = 5;
 
 /**
- * Deux demandes à la fois depuis une même adresse : une famille qui revient à
- * deux sur le même Wi-Fi passe, un client qui ouvre dix connexions pour remplir
- * la file — et faire refuser les vrais joueurs (« l'organisateur a déjà
- * plusieurs demandes ») — ne passe pas.
+ * Trois demandes à la fois depuis une même adresse : une famille qui revient à
+ * trois sur le même Wi-Fi passe — à deux, le troisième enfant était refusé —,
+ * un client qui ouvre dix connexions pour remplir la file — et faire refuser
+ * les vrais joueurs (« l'organisateur a déjà plusieurs demandes ») — ne passe
+ * pas.
  */
-export const MAX_SEAT_REQUESTS_PER_ADDRESS = 2;
-/** Après un refus de l'organisateur, l'adresse attend avant de redemander. */
+export const MAX_SEAT_REQUESTS_PER_ADDRESS = 3;
+/**
+ * Après un refus, le même prénom attend trois minutes depuis la même adresse ;
+ * le reste de la maison, trente secondes seulement. Un refus qui valait pour
+ * toute l'adresse bloquait trois minutes une famille entière sur un clic de
+ * travers — mais sans aucun délai d'adresse, l'intrus éconduit redéposait sa
+ * demande dans la seconde, sous un autre prénom.
+ */
 export const SEAT_REFUSAL_COOLDOWN_MS = 3 * 60 * 1000;
+export const ADDRESS_REFUSAL_COOLDOWN_MS = 30 * 1000;
+
+/** Les refus d'un salon : adresse seule, et adresse + prénom. */
+export type SeatRefusals = Map<string, number>;
+
+function refusalKeyForName(addressKey: string, name: string): string {
+  return `${addressKey}|${normalizeSeatName(name)}`;
+}
+
+/** Jusqu'à quand cette adresse, sous ce prénom, attend-elle encore ? */
+export function refusedUntil(
+  refusals: SeatRefusals | undefined,
+  addressKey: string,
+  name: string,
+): number | undefined {
+  if (!refusals) return undefined;
+  const byAddress = refusals.get(addressKey);
+  const byName = refusals.get(refusalKeyForName(addressKey, name));
+  if (byAddress === undefined && byName === undefined) return undefined;
+  return Math.max(byAddress ?? 0, byName ?? 0);
+}
+
+/** Retient un refus de l'organisateur, et oublie les refus échus. */
+export function recordRefusal(refusals: SeatRefusals, addressKey: string, name: string, now: number): void {
+  for (const [key, until] of refusals) if (until <= now) refusals.delete(key);
+  refusals.set(addressKey, now + ADDRESS_REFUSAL_COOLDOWN_MS);
+  refusals.set(refusalKeyForName(addressKey, name), now + SEAT_REFUSAL_COOLDOWN_MS);
+}
 
 export const REFUSED_RECENTLY =
   'L’organisateur a refusé une demande venue de votre connexion. Réessayez dans quelques minutes.';
@@ -116,7 +151,7 @@ export const QUEUE_FULL =
  * Une nouvelle demande peut-elle entrer dans la file d'un salon ?
  *
  * Une par connexion (la nouvelle remplace l'ancienne : l'appelant retire
- * d'abord celles de la connexion), deux par adresse, cinq par salon, et aucune
+ * d'abord celles de la connexion), trois par adresse, cinq par salon, et aucune
  * pendant le délai qui suit un refus de l'organisateur.
  */
 export function admitSeatRequest(

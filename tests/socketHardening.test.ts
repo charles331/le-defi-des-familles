@@ -30,7 +30,11 @@ async function startServer(roomMap: Map<string, Room>, limits?: Partial<SocketLi
 before(async () => {
   // Tous les clients des tests partagent l'adresse 127.0.0.1 : les plafonds par
   // adresse sont relevés ici, et éprouvés à part sur leur propre serveur.
-  const started = await startServer(rooms, { maxRoomsPerAddress: 1000, maxCodeFailuresPerAddress: 1000 });
+  const started = await startServer(rooms, {
+    maxRoomsPerAddress: 1000,
+    maxCodeFailuresPerAddress: 1000,
+    maxConnectionsPerAddress: 1000,
+  });
   server = started.instance;
   url = started.url;
 });
@@ -475,21 +479,22 @@ test('un client aux connexions multiples ne bloque pas la file des demandes', as
     socket.emit('join-room', { roomCode, player: { name: `Intrus ${i}` } });
     outcomes.push(await outcome);
   }
-  assert.deepEqual(outcomes, ['attente', 'attente', 'refus', 'refus', 'refus', 'refus']);
+  assert.deepEqual(outcomes, ['attente', 'attente', 'attente', 'refus', 'refus', 'refus']);
 
   const family = await client(url, { 'X-Forwarded-For': '198.51.100.4' });
   const pending = next(family, 'seat-request-pending');
   family.emit('join-room', { roomCode, player: { name: 'Thomas' } });
   assert.equal((await pending).name, 'Thomas');
-  assert.equal(room.seatRequests?.length, 3);
+  assert.equal(room.seatRequests?.length, 4);
 
   // Une connexion qui s'en va emporte sa demande.
   const leavingId = attackers[0].id;
   attackers[0].disconnect();
-  await until(() => room.seatRequests?.length === 2);
+  await until(() => room.seatRequests?.length === 3);
   assert.ok(!room.seatRequests!.some(request => request.socketId === leavingId));
 
-  // Éconduite, l'adresse ne revient pas aussitôt, même par une connexion neuve.
+  // Éconduite, l'adresse ne revient pas aussitôt, même par une connexion neuve
+  // et sous un autre prénom (trente secondes pour toute l'adresse).
   const [intruderRequest] = room.seatRequests!.filter(request => request.name.startsWith('Intrus'));
   host.emit('answer-seat-request', { roomCode, requestId: intruderRequest.id, accept: false });
   await until(() => room.seatRefusals?.has('203.0.113.9') === true);
@@ -531,3 +536,75 @@ test('un pion ne se pose pas sur une case qui n’existe pas', async () => {
   assert.equal(room.gameState.phase, 'moving');
 });
 
+
+test('une adresse ne multiplie pas son débit en ouvrant des connexions', async () => {
+  const own = await startServer(new Map(), { maxConnectionsPerAddress: 2 });
+  try {
+    const first = await client(own.url);
+    await client(own.url);
+    // La troisième est refusée dès la poignée de main…
+    await assert.rejects(client(own.url), /Trop de connexions/);
+    // … et une place libérée se reprend.
+    first.disconnect();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.ok((await client(own.url)).connected);
+  } finally {
+    await own.instance.close();
+  }
+});
+
+test('une adresse bloquée est prévenue sans prolonger son blocage ni être coupée', async () => {
+  const own = await startServer(new Map(), { maxCodeFailuresPerSocket: 1000, maxCodeFailuresPerAddress: 3 });
+  try {
+    const guesser = await client(own.url);
+    const cut = next(guesser, 'disconnect', 3000);
+    for (let i = 0; i < 4; i += 1) guesser.emit('join-room', { roomCode: `FAM-ZZZZZ${'2345'[i]}`, player: { name: 'X' } });
+    await cut;
+    // Un autre appareil de la même maison recharge sa page : il est prévenu,
+    // et garde sa connexion pour réessayer quand la minute sera passée.
+    const sibling = await client(own.url);
+    const warned = next(sibling, 'error-msg');
+    sibling.emit('reconnect-session', { roomCode: 'FAM-ZZZZZZ', playerId: 'x', sessionToken: 'y' });
+    assert.match(await warned, /Trop de codes/);
+    await silence(sibling, 'disconnect', 300);
+    assert.ok(sibling.connected);
+  } finally {
+    await own.instance.close();
+  }
+});
+
+test('l’organisateur déjà assis qui renvoie sa session ne ferme pas son salon', async () => {
+  const host = await client();
+  const created = await createRoom(host);
+  const room = rooms.get(created.roomCode)!;
+  const rejoined = next(host, 'room-joined');
+  host.emit('reconnect-session', { roomCode: created.roomCode, playerId: host.id, sessionToken: created.sessionToken });
+  assert.equal((await rejoined).player.id, host.id);
+  assert.ok(rooms.has(created.roomCode));
+  assert.ok(room.sockets.has(host.id!));
+  assert.equal(room.hostSocketId, host.id);
+});
+
+test('un pion ne va que sur une case calculée par le serveur, sans redirection', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host, 'Charles', { isLocalMode: true });
+  const room = rooms.get(roomCode)!;
+  room.gameState.phase = 'moving';
+  room.gameState.possibleMoves = [3, 5];
+  const before = room.gameState.players[0].currentTileId;
+  host.emit('move-player', { roomCode, destinationTileId: 7 });
+  await silence(host, 'game-state-update', 200);
+  assert.equal(room.gameState.players[0].currentTileId, before);
+});
+
+test('admis en cours de partie, un joueur compte comme prêt pour « Rejouer »', async () => {
+  const { host, roomCode, room } = await tableOfTwo();
+  room.gameState.phase = 'rolling';
+  const newcomer = await client();
+  const asked = next(host, 'seat-requests');
+  newcomer.emit('join-room', { roomCode, player: { name: 'Zoé' } });
+  const [request] = await asked;
+  const joined = next(newcomer, 'room-joined');
+  host.emit('answer-seat-request', { roomCode, requestId: request.id, accept: true });
+  assert.equal((await joined).player.isReady, true);
+});
