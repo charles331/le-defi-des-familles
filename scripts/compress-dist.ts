@@ -12,6 +12,22 @@ function walk(directory: string): string[] {
   });
 }
 
+/**
+ * `dist/` est servi tel quel par `express.static` : tout ce qui s'y trouve est
+ * public. Le bundle serveur et sa source map y ont vécu — trois mégaoctets qui
+ * contenaient toute la banque de questions, réponses comprises. Le build
+ * s'arrête désormais si un fichier de ce genre y réapparaît.
+ */
+const privateFiles = walk(distDir)
+  .map(filePath => path.relative(distDir, filePath))
+  .filter(relative => /\.(map|cjs|mjs|ts|tsx)$/.test(relative)
+    || /(^|[\\/])\.env/.test(relative)
+    || /(^|[\\/])server\./.test(relative));
+if (privateFiles.length > 0) {
+  console.error(`Fichiers non publics dans dist/ : ${privateFiles.join(', ')}`);
+  process.exit(1);
+}
+
 let compressedCount = 0;
 for (const filePath of walk(distDir)) {
   if (!compressibleExtensions.has(path.extname(filePath)) || filePath.endsWith('.map')) continue;

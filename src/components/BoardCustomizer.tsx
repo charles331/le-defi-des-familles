@@ -17,7 +17,6 @@ interface BoardCustomizerProps {
   isHost: boolean;
   generationToken?: string;
   onUpdateSettings: (newSettings: Partial<GameSettings>) => void;
-  onAddCustomPack?: (themeName: string, questions: any[]) => void;
   customPacks?: { name: string; questions?: any[]; questionCount?: number }[];
 }
 
@@ -26,7 +25,6 @@ export const BoardCustomizer: React.FC<BoardCustomizerProps> = ({
   isHost,
   generationToken,
   onUpdateSettings,
-  onAddCustomPack,
   customPacks = []
 }) => {
   const [customThemeInput, setCustomThemeInput] = useState('');
@@ -96,15 +94,15 @@ export const BoardCustomizer: React.FC<BoardCustomizerProps> = ({
         throw new Error(data.error || 'Impossible de générer le thème.');
       }
 
-      const examined = typeof data.examined === 'number' ? data.examined : data.questions.length;
+      // Le serveur range lui-même le pack dans le salon et l'active, en plus des
+      // autres : les cartes ne transitent plus par ce navigateur, qui ne reçoit
+      // que leur nombre. Le nouvel état du salon arrive par la socket.
+      const count = typeof data.count === 'number' ? data.count : 0;
+      const examined = typeof data.examined === 'number' ? data.examined : count;
       setGenSuccess(
-        `Thème "${data.themeName}" créé : ${data.questions.length} questions retenues`
+        `Thème "${data.themeName}" créé : ${count} questions retenues`
           + ` sur ${examined} générées (les non conformes sont écartées).`
       );
-      if (onAddCustomPack) {
-        // Le serveur active lui-même le thème généré, en plus des autres.
-        onAddCustomPack(data.themeName, data.questions);
-      }
       setCustomThemeInput('');
     } catch (err: any) {
       setGenError(err.message || 'Erreur de génération');

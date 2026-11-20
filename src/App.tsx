@@ -7,7 +7,6 @@ import {
   Player,
   EmojiReaction,
   CategoryId,
-  Question
 } from './types';
 import { BOARD_PRESETS } from './data/boards';
 import { Lobby } from './components/Lobby';
@@ -345,16 +344,6 @@ export default function App() {
     }
   };
 
-  const handleAddCustomPack = (themeName: string, questions: Question[]) => {
-    if (socket && gameState) {
-      socket.emit('add-custom-pack', {
-        roomCode: gameState.roomCode,
-        themeName,
-        questions
-      });
-    }
-  };
-
   const handleLeaveGame = () => {
     if (socket && gameState) {
       socket.emit('leave-room', { roomCode: gameState.roomCode });
@@ -385,7 +374,6 @@ export default function App() {
           onToggleReady={handleToggleReady}
           onUpdateSettings={handleUpdateSettings}
           onStartGame={handleStartGame}
-          onAddCustomPack={handleAddCustomPack}
           onLeaveGame={handleLeaveGame}
           errorMessage={errorMessage}
         />
