@@ -192,3 +192,152 @@ export function getStableClientId(): string {
     return 'no-storage';
   }
 }
+
+// ------------------------------------------------------------ défense du direct
+// Les fonctions ci-dessous sont pures, et testées comme telles : elles décident
+// à qui l'on montre sa caméra, et combien de messages d'un pair on accepte de
+// garder en mémoire. Le serveur filtre aussi (`isOnAir`), mais un client ne doit
+// jamais ouvrir sa caméra sur la seule foi d'un message relayé.
+
+/** Le strict nécessaire d'un joueur pour décider s'il peut nous regarder. */
+export interface ViewerCandidate {
+  id: string;
+  isConnected: boolean;
+}
+
+/**
+ * Un `webrtc-viewer-ready` ne suffit pas à recevoir notre flux : son expéditeur
+ * doit être assis à la table **et** connecté. Sans ce contrôle, n'importe quel
+ * identifiant relayé jusqu'à nous — un joueur parti, une socket qui n'a jamais
+ * rejoint la partie — recevait une offre, donc la caméra et le micro de la
+ * personne filmée.
+ */
+export function isAllowedViewer(
+  viewerId: unknown,
+  players: readonly ViewerCandidate[] | null | undefined,
+  selfId: string
+): boolean {
+  if (typeof viewerId !== 'string' || viewerId === '' || viewerId === selfId) return false;
+  return (players ?? []).some(player => player.id === viewerId && player.isConnected === true);
+}
+
+/**
+ * Plafond de candidates ICE gardées en attente pour un même pair. Une connexion
+ * réelle en produit une dizaine ; au-delà, c'est un pair qui inonde, et la file
+ * grossirait sans limite tant que la description distante n'arrive pas.
+ */
+export const MAX_PENDING_ICE_CANDIDATES = 50;
+
+/**
+ * Met `item` en file s'il reste de la place. Renvoie `false` quand la file est
+ * pleine : l'élément est alors ignoré, jamais une ancienne entrée évincée (les
+ * premières candidates sont les plus utiles, les hôtes locaux d'abord).
+ */
+export function enqueueBounded<T>(queue: T[], item: T, max: number = MAX_PENDING_ICE_CANDIDATES): boolean {
+  if (queue.length >= max) return false;
+  queue.push(item);
+  return true;
+}
+
+/** État minimal d'une connexion WebRTC, pour compter qui nous voit vraiment. */
+export interface ConnectionStateLike {
+  connectionState?: string;
+  iceConnectionState?: string;
+}
+
+/**
+ * Nombre de connexions sortantes réellement établies. Une offre envoyée n'est
+ * pas un spectateur : seul un lien établi transporte l'image. On lit aussi
+ * `iceConnectionState`, que d'anciens Safari renseignent seul.
+ */
+export function countLiveConnections(connections: Iterable<ConnectionStateLike>): number {
+  let count = 0;
+  for (const pc of connections) {
+    if (
+      pc.connectionState === 'connected'
+      || pc.iceConnectionState === 'connected'
+      || pc.iceConnectionState === 'completed'
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/** Le bandeau permanent de la personne filmée : qui la voit, en ce moment. */
+export function describeAudience(viewerCount: number): string {
+  if (!(viewerCount > 0)) return 'En direct · personne ne vous voit encore';
+  if (viewerCount === 1) return 'En direct · 1 personne vous voit';
+  return `En direct · ${viewerCount} personnes vous voient`;
+}
+
+/** Les STUN publics : ils suffisent dans la grande majorité des cas (ADR 0002). */
+export const PUBLIC_STUN_SERVERS: readonly RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' }
+];
+
+/** Ce qu'on lit encore des variables `VITE_TURN_*` au build. */
+export interface StaticTurnSettings {
+  url?: string;
+  username?: string;
+  credential?: string;
+}
+
+const ICE_URL = /^(stun|stuns|turn|turns):\S+$/i;
+
+function isIceUrlList(urls: unknown): urls is string | string[] {
+  if (typeof urls === 'string') return ICE_URL.test(urls);
+  return Array.isArray(urls) && urls.length > 0 && urls.every(url => typeof url === 'string' && ICE_URL.test(url));
+}
+
+/**
+ * Ne garde d'une liste reçue à l'exécution que des serveurs ICE bien formés :
+ * une entrée mal formée ferait lever `new RTCPeerConnection`, et le direct
+ * tomberait pour tout le monde au lieu d'ignorer un seul serveur.
+ */
+export function sanitizeIceServers(servers: unknown): RTCIceServer[] {
+  if (!Array.isArray(servers)) return [];
+  const clean: RTCIceServer[] = [];
+  for (const server of servers) {
+    if (!server || typeof server !== 'object') continue;
+    const { urls, username, credential } = server as Record<string, unknown>;
+    if (!isIceUrlList(urls)) continue;
+    const entry: RTCIceServer = { urls };
+    if (typeof username === 'string') entry.username = username;
+    if (typeof credential === 'string') entry.credential = credential;
+    clean.push(entry);
+  }
+  return clean;
+}
+
+/**
+ * Configuration ICE des connexions du direct.
+ *
+ * Les identifiants TURN ne doivent plus venir de `VITE_TURN_USERNAME` ni de
+ * `VITE_TURN_CREDENTIAL` : tout ce qui porte le préfixe `VITE_` est recopié en
+ * clair dans le bundle public, donc lisible par n'importe quel visiteur, qui
+ * peut alors faire relayer son propre trafic par notre serveur TURN, à nos
+ * frais. La bonne forme est un identifiant éphémère, délivré par le serveur à
+ * un joueur assis dans une partie et qui expire vite : c'est ce qu'attend
+ * `runtimeIceServers`.
+ *
+ * Tant que le serveur n'en fournit pas, le comportement reste celui
+ * d'aujourd'hui — STUN publics, plus le TURN statique s'il est configuré —
+ * pour ne casser aucune partie pendant la transition. Une fois les identifiants
+ * éphémères en place, les `VITE_TURN_*` sont à vider.
+ */
+export function buildIceConfiguration(
+  runtimeIceServers?: unknown,
+  staticTurn: StaticTurnSettings = {}
+): RTCConfiguration {
+  const runtime = sanitizeIceServers(runtimeIceServers);
+  if (runtime.length > 0) {
+    return { iceServers: [...PUBLIC_STUN_SERVERS, ...runtime] };
+  }
+
+  const legacyTurn: RTCIceServer[] = staticTurn.url
+    ? [{ urls: staticTurn.url, username: staticTurn.username, credential: staticTurn.credential }]
+    : [];
+  return { iceServers: [...PUBLIC_STUN_SERVERS, ...legacyTurn] };
+}
