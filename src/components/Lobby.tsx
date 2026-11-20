@@ -643,8 +643,8 @@ export const Lobby: React.FC<LobbyProps> = ({
               type="text"
               value={joinCodeInput}
               onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
-              placeholder="FAM-XXXX"
-              maxLength={8}
+              placeholder="FAM-XXXXXX"
+              maxLength={10}
               className="w-full px-4 py-3 rounded-2xl border-2 border-amber-500/60 bg-amber-500/5 dark:bg-slate-800 text-slate-900 dark:text-white font-mono font-black text-xl text-center tracking-widest focus:outline-none focus:border-amber-500 shadow-inner"
             />
           </div>

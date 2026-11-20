@@ -29,7 +29,8 @@ import {
   sanitizeSettings,
   sanitizeThemeNames,
 } from './inputValidation';
-import { normalizeRoomCode } from './roomCodes';
+import { generateRoomCode, normalizeRoomCode } from './roomCodes';
+import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin } from './socketGuards';
 import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
 import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
 import { activeThemeKeys, pickQuestionForPlayer } from './questionSelection';
@@ -81,6 +82,11 @@ export interface Room {
   lastActivityAt: number;
   emptySince: number | null;
   hostDisconnectedAt: number | null;
+  /**
+   * Clé d'adresse de celui qui a créé le salon (voir `clientAddress`), pour le
+   * quota de salons par foyer. Absente d'un salon rechargé du disque.
+   */
+  creatorKey?: string;
 }
 
 /** Mélange de Fisher-Yates, partagé par le démarrage de partie et la reprise. */
@@ -106,8 +112,13 @@ const MAX_CUSTOM_QUESTIONS_PER_ROOM = 180;
 const HOST_RECONNECT_GRACE_MS = positiveDuration(process.env.ROOM_HOST_GRACE_MS, 10 * 60 * 1000);
 const EMPTY_ROOM_GRACE_MS = positiveDuration(process.env.ROOM_EMPTY_GRACE_MS, 10 * 60 * 1000);
 // Partie en pause : le salon est conservé quatre heures, le temps d'un repas ou
-// d'une soirée, même si tout le monde a fermé son navigateur.
+// d'une soirée, tant que quelqu'un garde la page ouverte.
 const PAUSED_ROOM_TTL_MS = positiveDuration(process.env.ROOM_PAUSED_TTL_MS, 4 * 60 * 60 * 1000);
+// Mais une pause sans plus personne de connecté ne tient qu'une demi-heure. Les
+// quatre heures valaient aussi pour un salon que plus aucun appareil ne
+// regardait : créer des salons, les mettre en pause et fermer l'onglet suffisait
+// à occuper durablement les deux cent cinquante places du serveur.
+const PAUSED_EMPTY_ROOM_GRACE_MS = positiveDuration(process.env.ROOM_PAUSED_EMPTY_GRACE_MS, 30 * 60 * 1000);
 const ROOM_IDLE_TTL_MS = positiveDuration(process.env.ROOM_IDLE_TTL_MS, 4 * 60 * 60 * 1000);
 const ROOM_MAX_AGE_MS = positiveDuration(process.env.ROOM_MAX_AGE_MS, 12 * 60 * 60 * 1000);
 const ROOM_SWEEP_INTERVAL_MS = positiveDuration(process.env.ROOM_SWEEP_INTERVAL_MS, 30 * 1000);
@@ -124,11 +135,53 @@ const ROOM_SWEEP_INTERVAL_MS = positiveDuration(process.env.ROOM_SWEEP_INTERVAL_
  */
 export const MAX_SOCKET_PAYLOAD_BYTES = 128 * 1024;
 
+/**
+ * Les plafonds contre un client qui abuse. Réglables pour les tests, où tous
+ * les clients partagent la même adresse.
+ */
+export interface SocketLimits {
+  /** Salons actifs créés depuis une même adresse (un /64 en IPv6). */
+  maxRoomsPerAddress: number;
+  /** Codes de salon inexistants essayés par une connexion, par minute. */
+  maxCodeFailuresPerSocket: number;
+  /** Idem pour une adresse entière, qui peut ouvrir connexion sur connexion. */
+  maxCodeFailuresPerAddress: number;
+  /**
+   * Débit d'événements par connexion : rafale tolérée, puis débit soutenu.
+   * Un joueur humain envoie quelques événements par seconde au plus — la
+   * saisie du prénom au clavier, lettre par lettre, est la plus rapide.
+   */
+  eventBurst: number;
+  eventsPerSecond: number;
+  /**
+   * Les candidats ICE arrivent en salve à l'ouverture de chaque connexion
+   * vidéo — une ou deux dizaines par pair, et un joueur à l'antenne en ouvre une
+   * par spectateur, onze au plus : ils ont leur propre seau, plus large.
+   */
+  candidateBurst: number;
+  candidatesPerSecond: number;
+}
+
+export const DEFAULT_SOCKET_LIMITS: SocketLimits = {
+  maxRoomsPerAddress: 3,
+  maxCodeFailuresPerSocket: 10,
+  maxCodeFailuresPerAddress: 30,
+  eventBurst: 40,
+  eventsPerSecond: 20,
+  candidateBurst: 300,
+  candidatesPerSecond: 100,
+};
+
+const CODE_FAILURE_WINDOW_MS = 60 * 1000;
+
 export interface GameSocketServerOptions {
   /** Les salons, éventuellement rechargés du disque par l'appelant. */
   rooms: Map<string, Room>;
   /** Écrit l'état des salons ; sans effet dans les tests. */
   persist: () => void;
+  limits?: Partial<SocketLimits>;
+  /** Origines admises en plus de la page servie par ce serveur (`PUBLIC_ORIGIN`). */
+  publicOrigins?: string[];
 }
 
 export interface GameSocketServer {
@@ -147,23 +200,42 @@ function safeTokenEquals(actual: unknown, expected: string): boolean {
 
 export function attachGameSocketServer(
   httpServer: HttpServer,
-  { rooms, persist }: GameSocketServerOptions,
+  { rooms, persist, limits: limitOverrides, publicOrigins = [] }: GameSocketServerOptions,
 ): GameSocketServer {
+  const limits: SocketLimits = { ...DEFAULT_SOCKET_LIMITS, ...limitOverrides };
   const io = new Server(httpServer, {
-    cors: {
-      origin: '*',
-      methods: ['GET', 'POST']
+    // Plus d'`origin: '*'` : seule la page du jeu, servie par ce serveur, et
+    // les origines de `PUBLIC_ORIGIN` ouvrent une connexion depuis un
+    // navigateur. `allowRequest` couvre aussi le WebSocket, que les en-têtes
+    // CORS ne protègent pas.
+    cors: publicOrigins.length > 0 ? { origin: publicOrigins, methods: ['GET', 'POST'] } : undefined,
+    allowRequest: (req, callback) => {
+      const allowed = isAllowedOrigin(
+        req.headers.origin,
+        [req.headers.host, req.headers['x-forwarded-host']],
+        publicOrigins,
+      );
+      if (!allowed) console.warn(`[Socket] Origine refusée : ${String(req.headers.origin).slice(0, 200)}`);
+      callback(null, allowed);
     },
     maxHttpBufferSize: MAX_SOCKET_PAYLOAD_BYTES,
   });
 
+  const codeFailuresBySocket = new FailureWindow(limits.maxCodeFailuresPerSocket, CODE_FAILURE_WINDOW_MS);
+  const codeFailuresByAddress = new FailureWindow(limits.maxCodeFailuresPerAddress, CODE_FAILURE_WINDOW_MS);
 
-  /** Le salon désigné par un code venu du réseau, quelle qu'en soit la forme. */
-  function getRoom(rawCode: unknown): Room | undefined {
+  /**
+   * Le salon désigné par un code venu du réseau, quelle qu'en soit la forme.
+   *
+   * Seule l'action d'un membre compte comme activité : un appel refusé d'un
+   * inconnu rafraîchissait l'horloge d'inactivité, et suffisait à garder en vie
+   * indéfiniment un salon abandonné.
+   */
+  function getRoom(rawCode: unknown, actorId?: string): Room | undefined {
     const code = normalizeRoomCode(rawCode);
     if (!code) return undefined;
     const room = rooms.get(code);
-    if (room) room.lastActivityAt = Date.now();
+    if (room && actorId && room.sockets.has(actorId)) room.lastActivityAt = Date.now();
     return room;
   }
 
@@ -220,6 +292,7 @@ export function attachGameSocketServer(
     room.reconnectTokens.delete(previousSeatId);
     room.reconnectTokens.set(socket.id, sessionToken);
     room.emptySince = null;
+    room.lastActivityAt = Date.now();
 
     if (room.hostSocketId === previousSeatId) {
       room.hostSocketId = socket.id;
@@ -266,11 +339,14 @@ export function attachGameSocketServer(
     for (const [code, room] of rooms.entries()) {
       // Une partie en pause échappe aux délais courts : ni l'absence de
       // l'organisateur ni un salon vide ne la ferment. Seule la fenêtre de pause
-      // la limite, afin qu'un salon oublié ne reste pas indéfiniment ouvert.
+      // la limite, afin qu'un salon oublié ne reste pas indéfiniment ouvert —
+      // et, quand plus aucun appareil n'est connecté, une demi-heure d'absence.
       if (room.gameState.isPaused) {
         const pausedSince = room.gameState.pausedAt ?? now;
         if (now - pausedSince >= PAUSED_ROOM_TTL_MS) {
           closeRoom(code, 'La partie est restée en pause trop longtemps.');
+        } else if (room.sockets.size === 0 && room.emptySince && now - room.emptySince >= PAUSED_EMPTY_ROOM_GRACE_MS) {
+          closeRoom(code, 'La partie en pause n’avait plus aucun joueur connecté.');
         }
         continue;
       }
@@ -288,22 +364,51 @@ export function attachGameSocketServer(
   }, ROOM_SWEEP_INTERVAL_MS);
   roomSweep.unref();
 
-  function generateRoomCode(): string {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    for (let attempt = 0; attempt < 20; attempt++) {
-      let code = '';
-      for (let i = 0; i < 4; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-      const candidate = `FAM-${code}`;
-      if (!rooms.has(candidate)) return candidate;
-    }
-    throw new Error('Impossible de générer un code de salon unique.');
-  }
-
   // Socket.IO Connection Handler
   io.on('connection', (socket: Socket) => {
     console.log(`[Socket] Connexion: ${socket.id}`);
+    const addressOfClient = clientAddress(socket.handshake.address, socket.handshake.headers['x-forwarded-for']);
+
+    // Débit par connexion. Un événement au-delà du seau est ignoré, sans
+    // réponse : un client légitime n'y arrive jamais, et lui répondre
+    // nourrirait le flot qu'on veut tarir. Un client qui insiste est déconnecté.
+    const startedAt = Date.now();
+    const events = new TokenBucket(limits.eventBurst, limits.eventsPerSecond, startedAt);
+    const candidates = new TokenBucket(limits.candidateBurst, limits.candidatesPerSecond, startedAt);
+    const floods = new FailureWindow(limits.eventBurst * 5, CODE_FAILURE_WINDOW_MS);
+    socket.use(([event], nextEvent) => {
+      const now = Date.now();
+      const bucket = event === 'webrtc-candidate' ? candidates : events;
+      if (bucket.take(now)) return nextEvent();
+      if (floods.record(socket.id, now)) {
+        console.warn(`[Socket] ${socket.id} déconnecté : trop d'événements.`);
+        socket.disconnect(true);
+      }
+    });
+
+    /**
+     * Un code de salon qui n'existe pas. Au-delà de dix par minute pour une
+     * connexion — ou trente pour une adresse, qui peut se reconnecter en boucle —,
+     * ce n'est plus une faute de frappe : c'est quelqu'un qui essaie les codes un
+     * par un. Il est prévenu, puis déconnecté.
+     *
+     * Renvoie vrai si la connexion a été coupée.
+     */
+    function recordUnknownRoomCode(): boolean {
+      const now = Date.now();
+      const socketBlocked = codeFailuresBySocket.record(socket.id, now);
+      const addressBlocked = codeFailuresByAddress.record(addressOfClient, now);
+      if (!socketBlocked && !addressBlocked) return false;
+      console.warn(`[Socket] ${socket.id} (${addressOfClient}) déconnecté : trop de codes de salon inexistants.`);
+      socket.emit('error-msg', 'Trop de codes de salon inconnus. Vérifiez le code et réessayez dans une minute.');
+      socket.disconnect(true);
+      return true;
+    }
+
+    /** Une adresse déjà bloquée ne peut plus rien essayer, même depuis une connexion neuve. */
+    function isAddressBlocked(): boolean {
+      return codeFailuresByAddress.isBlocked(addressOfClient, Date.now());
+    }
 
     /**
      * Enregistre un handler d'événement client, derrière deux garde-fous.
@@ -335,8 +440,14 @@ export function attachGameSocketServer(
       if (rooms.size >= MAX_ROOMS) {
         return socket.emit('error-msg', 'Trop de salons sont actifs. Réessayez dans quelques minutes.');
       }
+      // Trois salons ouverts par foyer : de quoi recommencer une partie ratée,
+      // pas de quoi occuper à soi seul les places du serveur.
+      const roomsFromAddress = [...rooms.values()].filter(room => room.creatorKey === addressOfClient).length;
+      if (roomsFromAddress >= limits.maxRoomsPerAddress) {
+        return socket.emit('error-msg', 'Vous avez déjà plusieurs salons ouverts. Fermez-en un avant d’en créer un autre.');
+      }
 
-      const roomCode = generateRoomCode();
+      const roomCode = generateRoomCode(code => rooms.has(code));
       const requestedSettings = sanitizeSettings(data.settings);
       const isLocal = requestedSettings.isLocalMode === true;
       const profile = sanitizePlayerProfile(data.player, { avatarId: 'lion', color: '#EF4444', difficulty: 'adulte' });
@@ -400,7 +511,8 @@ export function attachGameSocketServer(
         createdAt: now,
         lastActivityAt: now,
         emptySince: null,
-        hostDisconnectedAt: null
+        hostDisconnectedAt: null,
+        creatorKey: addressOfClient,
       };
 
       rooms.set(roomCode, room);
@@ -418,10 +530,12 @@ export function attachGameSocketServer(
 
     // Reconnect Existing Session (on page refresh or disconnect recovery)
     on('reconnect-session', (data: { roomCode: string; playerId: string; sessionToken?: string }) => {
+      if (isAddressBlocked()) return void recordUnknownRoomCode();
       const code = normalizeRoomCode(data.roomCode) ?? '';
-      const room = getRoom(code);
+      const room = getRoom(code, socket.id);
 
       if (!room) {
+        if (recordUnknownRoomCode()) return;
         return socket.emit('reconnect-failed', { message: 'Salon expiré ou introuvable.' });
       }
 
@@ -448,10 +562,12 @@ export function attachGameSocketServer(
 
     // Join Room
     on('join-room', (data: { roomCode: unknown; player?: unknown }) => {
+      if (isAddressBlocked()) return void recordUnknownRoomCode();
       const code = normalizeRoomCode(data.roomCode) ?? '';
-      const room = getRoom(code);
+      const room = getRoom(code, socket.id);
 
       if (!room) {
+        if (recordUnknownRoomCode()) return;
         return socket.emit('error-msg', 'Salon introuvable. Vérifiez le code de la salle privée.');
       }
       const profile = sanitizePlayerProfile(data.player, { avatarId: 'fox', color: '#3B82F6', difficulty: 'adulte' });
@@ -512,6 +628,7 @@ export function attachGameSocketServer(
       room.reconnectTokens.set(socket.id, sessionToken);
       room.gameState.players.push(newPlayer);
       room.emptySince = null;
+      room.lastActivityAt = Date.now();
       socket.join(code);
 
       socket.emit('room-joined', {
@@ -526,7 +643,7 @@ export function attachGameSocketServer(
 
     // Local Pass & Play Add Player
     on('add-local-player', (data: { roomCode: string; player?: unknown }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode) return;
       if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
         return socket.emit('error-msg', 'Ce salon a atteint sa limite de joueurs.');
@@ -573,7 +690,7 @@ export function attachGameSocketServer(
      * « Quitter ».
      */
     on('remove-player', (data: { roomCode: string; playerId: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
       if (!data.playerId || data.playerId === room.hostSocketId) return;
 
@@ -610,7 +727,7 @@ export function attachGameSocketServer(
      * l'appareil du doublon qui en reprend les commandes.
      */
     on('merge-player', (data: { roomCode: string; sourcePlayerId: string; targetPlayerId: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
 
       const seat = room.gameState.players.find(player => player.id === data.targetPlayerId);
@@ -653,7 +770,7 @@ export function attachGameSocketServer(
     });
 
     on('remove-local-player', (data: { roomCode: string; playerId: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode || room.gameState.phase !== 'lobby') return;
       if (typeof data.playerId !== 'string' || !data.playerId.startsWith('local_')) return;
 
@@ -662,7 +779,7 @@ export function attachGameSocketServer(
     });
 
     on('toggle-ready', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase !== 'lobby' || room.settings.isLocalMode) return;
 
       const player = room.gameState.players.find(p => p.id === socket.id);
@@ -674,7 +791,7 @@ export function attachGameSocketServer(
 
     // Update Settings (Host only)
     on('update-settings', (data: { roomCode: string; settings: Partial<GameSettings> }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
 
       // Les réglages ne se modifient que dans le salon. Sans ce garde, un client
@@ -696,7 +813,7 @@ export function attachGameSocketServer(
 
     // Update Player Profile (Avatar, Color, Name, Difficulty)
     on('update-player', (data: { roomCode: string; player?: unknown }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !isPlainObject(data.player)) return;
       const update = data.player;
 
@@ -735,7 +852,7 @@ export function attachGameSocketServer(
 
     // Add Custom AI Theme Pack
     on('add-custom-pack', (data: { roomCode: string; themeName?: unknown; questions?: unknown }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
 
       // Chaque carte est refaite par le serveur : identifiant neuf, thème du
@@ -808,7 +925,7 @@ export function attachGameSocketServer(
      * en relancer une, pas s'en aller.
      */
     on('return-to-lobby', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase === 'lobby') return;
 
@@ -821,7 +938,7 @@ export function attachGameSocketServer(
 
     // Start Game
     on('start-game', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
 
       if (room.gameState.players.length < 1) {
@@ -911,7 +1028,7 @@ export function attachGameSocketServer(
 
     // Tirage du premier joueur : un seul lancer par joueur.
     on('roll-first-player', (data: { roomCode: string; playerId?: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase !== 'first_player_roll') return;
       if (isPaused(room)) return;
 
@@ -932,7 +1049,7 @@ export function attachGameSocketServer(
      * indéfiniment le lancement de la partie.
      */
     on('end-first-player-roll', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase !== 'first_player_roll') return;
 
@@ -976,7 +1093,7 @@ export function attachGameSocketServer(
      * minuteur repart là où il s'était arrêté au lieu d'avoir expiré entre-temps.
      */
     on('toggle-pause', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.hostSocketId !== socket.id) return;
       if (room.gameState.phase === 'lobby' || room.gameState.phase === 'game_over') return;
 
@@ -1000,7 +1117,7 @@ export function attachGameSocketServer(
       /** Angle du geste, en degrés : il donne la direction du dé sur le plateau. */
       angle?: number | null;
     }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase !== 'rolling') return;
       if (isPaused(room)) return;
 
@@ -1052,7 +1169,7 @@ export function attachGameSocketServer(
 
     // Move Token to Tile
     on('move-player', (data: { roomCode: string; destinationTileId: number }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase !== 'moving') return;
       if (isPaused(room)) return;
 
@@ -1132,7 +1249,7 @@ export function attachGameSocketServer(
     // lancer, et le quartier d'arrivée était déjà décidé en arrivant sur la case.
     // Toute la table voit alors la même roue tourner et s'arrêter au même endroit.
     on('spin-surprise-wheel', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || isPaused(room)) return;
       if (room.gameState.phase !== 'question') return;
       if (!isPlayerAllowedToAct(room, socket.id)) return;
@@ -1154,7 +1271,7 @@ export function attachGameSocketServer(
     // joueur actif — c'est lui qui donne le rythme, les autres écrans referment leur
     // roue en voyant le minuteur démarrer.
     on('start-question-timer', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || isPaused(room)) return;
       if (room.gameState.phase !== 'question') return;
       if (!isPlayerAllowedToAct(room, socket.id)) return;
@@ -1169,7 +1286,7 @@ export function attachGameSocketServer(
     // Use a stored question bonus. The server chooses the eliminated answers so
     // the correct answer never needs to be sent to the answering player's client.
     on('use-bonus', (data: { roomCode: string; bonusType: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || isPaused(room)) return;
       if (!BONUS_ROSTER.includes(data.bonusType as BonusType)) return;
       // `isPlayerAllowedToAct` et non `isPlayerAllowedToAnswer` : le lecteur a le
@@ -1199,7 +1316,7 @@ export function attachGameSocketServer(
 
     // Submit Question Answer
     on('submit-answer', (data: { roomCode: string; optionIndex: number }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase !== 'question' || !room.gameState.currentQuestion) return;
       if (isPaused(room)) return;
       if (!isPlayerAllowedToAnswer(room, socket.id)) return;
@@ -1213,7 +1330,7 @@ export function attachGameSocketServer(
 
     // Next Turn or Extra Turn
     on('next-turn', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || room.gameState.phase === 'game_over') return;
       if (isPaused(room)) return;
 
@@ -1236,7 +1353,7 @@ export function attachGameSocketServer(
     // objet à la place de l'emoji et faire planter le rendu de toute la table.
     let lastReactionAt = 0;
     on('send-emoji', (data: { roomCode: string; emoji: unknown }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!isReactionEmoji(data.emoji)) return;
       const now = Date.now();
@@ -1266,7 +1383,7 @@ export function attachGameSocketServer(
       && resolveOnAirIds(room.gameState.players, room.gameState.activePlayerIndex).includes(socketId);
 
     on('webrtc-broadcaster-ready', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !isOnAir(room, socket.id)) return;
 
       socket.to(room.code).emit('webrtc-broadcaster-ready', {
@@ -1275,7 +1392,7 @@ export function attachGameSocketServer(
     });
 
     on('webrtc-viewer-ready', (data: { roomCode: string; targetPlayerId: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!isOnAir(room, data.targetPlayerId)) return;
       // A publisher never subscribes to itself, and asking for one's own stream
@@ -1288,7 +1405,7 @@ export function attachGameSocketServer(
     });
 
     on('webrtc-offer', (data: { roomCode: string; targetPlayerId: string; offer: any }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !isOnAir(room, socket.id)) return;
       if (!room.sockets.has(data.targetPlayerId)) return;
 
@@ -1299,7 +1416,7 @@ export function attachGameSocketServer(
     });
 
     on('webrtc-answer', (data: { roomCode: string; targetPlayerId: string; answer: any }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!isOnAir(room, data.targetPlayerId)) return;
 
@@ -1315,7 +1432,7 @@ export function attachGameSocketServer(
       publisherId: string;
       candidate: any;
     }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       if (!room || !room.sockets.has(socket.id)) return;
       if (!room.sockets.has(data.targetPlayerId)) return;
       // The candidate must belong to a live connection, and both ends must be part
@@ -1332,7 +1449,7 @@ export function attachGameSocketServer(
     });
 
     on('webrtc-stop', (data: { roomCode: string }) => {
-      const room = getRoom(data.roomCode);
+      const room = getRoom(data.roomCode, socket.id);
       // Any room member may announce that their own stream stopped: a sender can
       // only ever speak about itself here. Requiring the broadcaster role would
       // reject the notice sent at the end of a turn, since the phase has already
@@ -1347,7 +1464,7 @@ export function attachGameSocketServer(
 
     on('leave-room', (data: { roomCode: string }) => {
       const code = normalizeRoomCode(data.roomCode) ?? '';
-      const room = getRoom(code);
+      const room = getRoom(code, socket.id);
       if (!room || !room.sockets.has(socket.id)) return;
 
       if (room.hostSocketId === socket.id) {

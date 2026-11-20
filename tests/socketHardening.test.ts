@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { after, before, test } from 'node:test';
 import { io as connect, Socket as ClientSocket } from 'socket.io-client';
-import { GameSocketServer, Room, attachGameSocketServer } from '../src/server/gameSocketServer';
+import { GameSocketServer, Room, SocketLimits, attachGameSocketServer } from '../src/server/gameSocketServer';
 
 /**
  * Le serveur de jeu, éprouvé par de vrais clients socket.io.
@@ -19,11 +19,19 @@ let url = '';
 const rooms = new Map<string, Room>();
 const clients: ClientSocket[] = [];
 
-before(async () => {
+async function startServer(roomMap: Map<string, Room>, limits?: Partial<SocketLimits>) {
   const httpServer = createServer();
-  server = attachGameSocketServer(httpServer, { rooms, persist: () => {} });
+  const instance = attachGameSocketServer(httpServer, { rooms: roomMap, persist: () => {}, limits });
   await new Promise<void>(resolve => httpServer.listen(0, '127.0.0.1', resolve));
-  url = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
+  return { instance, url: `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}` };
+}
+
+before(async () => {
+  // Tous les clients des tests partagent l'adresse 127.0.0.1 : les plafonds par
+  // adresse sont relevés ici, et éprouvés à part sur leur propre serveur.
+  const started = await startServer(rooms, { maxRoomsPerAddress: 1000, maxCodeFailuresPerAddress: 1000 });
+  server = started.instance;
+  url = started.url;
 });
 
 after(async () => {
@@ -31,8 +39,8 @@ after(async () => {
   await server.close();
 });
 
-async function client(): Promise<ClientSocket> {
-  const socket = connect(url, { transports: ['websocket'], forceNew: true, reconnection: false });
+async function client(target = url, extraHeaders?: Record<string, string>): Promise<ClientSocket> {
+  const socket = connect(target, { transports: ['websocket'], forceNew: true, reconnection: false, extraHeaders });
   clients.push(socket);
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', () => resolve());
@@ -217,5 +225,87 @@ test('en partie, un joueur ne change plus que son avatar', async () => {
   assert.equal(me.name, 'Charles');
   assert.equal(me.difficulty, 'adulte');
   assert.equal(me.avatarId, 'owl');
+});
+
+test('les nouveaux codes ont six caractères, les anciens restent rejoignables', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host);
+  assert.match(roomCode, /^FAM-[A-Z2-9]{6}$/);
+
+  // Un salon à quatre caractères, comme ceux qu'a laissés la version d'avant.
+  const legacy = rooms.get(roomCode)!;
+  rooms.delete(roomCode);
+  legacy.code = 'FAM-ABCD';
+  legacy.gameState.roomCode = 'FAM-ABCD';
+  rooms.set('FAM-ABCD', legacy);
+  const guest = await client();
+  const joined = next(guest, 'room-joined');
+  guest.emit('join-room', { roomCode: ' fam-abcd ', player: { name: 'Laura' } });
+  assert.equal((await joined).roomCode, 'FAM-ABCD');
+});
+
+test('la force brute sur les codes de salon est coupée', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host);
+  const attacker = await client();
+  const disconnected = next(attacker, 'disconnect', 3000);
+  for (let i = 0; i < 11; i += 1) {
+    attacker.emit('join-room', { roomCode: `FAM-ZZZZ${'23456789'[i % 8]}${'23456789'[Math.floor(i / 8)]}`, player: { name: 'X' } });
+  }
+  // Même le bon code, essayé ensuite, ne passe plus : la connexion est coupée.
+  attacker.emit('join-room', { roomCode, player: { name: 'X' } });
+  await disconnected;
+  assert.equal(rooms.get(roomCode)!.gameState.players.length, 1);
+});
+
+test('un flot d’événements est tari, puis la connexion coupée', async () => {
+  const flooder = await client();
+  const disconnected = next(flooder, 'disconnect', 3000);
+  for (let i = 0; i < 400; i += 1) flooder.emit('toggle-ready', { roomCode: 'FAM-ZZZZZZ' });
+  await disconnected;
+});
+
+test('une page d’une autre origine ne se connecte pas', async () => {
+  await assert.rejects(client(url, { Origin: 'https://pirate.example' }));
+  const local = await client(url, { Origin: url });
+  assert.ok(local.connected);
+});
+
+test('trois salons ouverts par adresse, pas un de plus', async () => {
+  const ownRooms = new Map<string, Room>();
+  const { instance, url: ownUrl } = await startServer(ownRooms);
+  const own: ClientSocket[] = [];
+  try {
+    for (let i = 0; i < 3; i += 1) {
+      const host = await client(ownUrl);
+      own.push(host);
+      await createRoom(host, `Hôte ${i}`);
+    }
+    const fourth = await client(ownUrl);
+    own.push(fourth);
+    const refused = next(fourth, 'error-msg');
+    fourth.emit('create-room', { player: { name: 'Encore' }, settings: {} });
+    assert.match(await refused, /plusieurs salons/);
+    assert.equal(ownRooms.size, 3);
+  } finally {
+    for (const socket of own) socket.disconnect();
+    await instance.close();
+  }
+});
+
+test('un appel refusé d’un inconnu ne rafraîchit pas le salon', async () => {
+  const host = await client();
+  const { roomCode } = await createRoom(host);
+  const room = rooms.get(roomCode)!;
+  room.lastActivityAt = 1;
+  const outsider = await client();
+  outsider.emit('start-game', { roomCode });
+  outsider.emit('toggle-pause', { roomCode });
+  await silence(outsider, 'game-state-update', 200);
+  assert.equal(room.lastActivityAt, 1);
+  const updated = next(host, 'game-state-update');
+  host.emit('update-settings', { roomCode, settings: { wedgesToWin: 3 } });
+  await updated;
+  assert.ok(room.lastActivityAt > 1);
 });
 

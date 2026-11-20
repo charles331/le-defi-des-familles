@@ -20,6 +20,7 @@ import { previewOrigin, withAbsolutePreviewImages } from './src/server/previewMe
 import { createQuestionGenerator } from './src/server/questionGenerator.js';
 import { DEFAULT_GENERATED_PACK_COUNT } from './src/config/generatedPack.js';
 import { Room, attachGameSocketServer, shuffled } from './src/server/gameSocketServer.js';
+import { parsePublicOrigins } from './src/server/socketGuards.js';
 import {
   Question,
   DifficultyLevel
@@ -232,7 +233,11 @@ app.post('/api/generate-pack', async (req, res) => {
 // les salles en cours. Les salons eux-mêmes, et tout le jeu en temps réel,
 // vivent dans `src/server/gameSocketServer.ts`.
 const rooms: Map<string, Room> = loadRooms(QUESTIONS_DATABASE, shuffled);
-attachGameSocketServer(httpServer, { rooms, persist: () => saveRooms(rooms) });
+attachGameSocketServer(httpServer, {
+  rooms,
+  persist: () => saveRooms(rooms),
+  publicOrigins: parsePublicOrigins(process.env.PUBLIC_ORIGIN),
+});
 
 // Dernier filet. Les handlers de socket.io attrapent déjà leurs propres
 // exceptions ; ce qui arrive encore ici est un bug ailleurs, et l'état du
