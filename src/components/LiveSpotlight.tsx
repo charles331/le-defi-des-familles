@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Camera, CameraOff, Mic, MicOff, Video, VideoOff, Volume2, VolumeX, AlertTriangle } from 'lucide-react';
 import { useLiveCamera } from '../contexts/liveCamera';
+import { describeAudience } from '../utils/media';
 
 const ICON_BUTTON = 'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border transition-colors';
 
@@ -30,6 +31,7 @@ export const LiveSpotlight: React.FC = () => {
     isVideoOff,
     toggleVideo,
     stopBroadcast,
+    viewerCount,
     needsManualStart,
     startBroadcast,
     remoteParticipants,
@@ -149,6 +151,17 @@ export const LiveSpotlight: React.FC = () => {
             >
               {isVideoOff ? <VideoOff className="h-4 w-4" /> : <Video className="h-4 w-4" />}
             </button>
+            {/* Toujours visible pendant la diffusion, repliée ou non : la personne
+                filmée doit savoir à chaque instant combien de personnes la voient.
+                Le compte ne retient que les connexions établies. */}
+            <p
+              role="status"
+              aria-live="polite"
+              className="flex min-w-0 items-center gap-1 truncate rounded-full bg-red-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-red-600 dark:text-red-300"
+            >
+              <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-red-500" />
+              <span className="truncate">{describeAudience(viewerCount)}</span>
+            </p>
           </>
         )}
 

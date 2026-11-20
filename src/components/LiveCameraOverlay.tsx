@@ -7,9 +7,13 @@ import { resolveLiveRole, resolveOnAirIds, resolveReaderId } from '../server/tur
 import {
   BROADCAST_CONSTRAINTS,
   PERMISSION_PROBE_CONSTRAINTS,
+  buildIceConfiguration,
+  countLiveConnections,
   describeMediaError,
   detectMediaAvailability,
+  enqueueBounded,
   getStableClientId,
+  isAllowedViewer,
   limitOutgoingVideo,
   releaseVideoElement
 } from '../utils/media';
@@ -18,22 +22,20 @@ interface LiveCameraOverlayProps {
   socket: Socket | null;
   gameState: GameState;
   currentUserId: string;
+  /**
+   * Serveurs ICE fournis à l'exécution — à terme, des identifiants TURN
+   * éphémères délivrés par le serveur. Absents, on retombe sur la configuration
+   * d'aujourd'hui (voir `buildIceConfiguration`).
+   */
+  iceServers?: RTCIceServer[];
 }
 
-const optionalTurnServer = import.meta.env.VITE_TURN_URL
-  ? [{
-      urls: import.meta.env.VITE_TURN_URL,
-      username: import.meta.env.VITE_TURN_USERNAME,
-      credential: import.meta.env.VITE_TURN_CREDENTIAL
-    }]
-  : [];
-
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    ...optionalTurnServer
-  ]
+// Repli de transition : ces variables sont compilées en clair dans le bundle
+// public. Elles ne doivent plus porter de secret — voir `buildIceConfiguration`.
+const STATIC_TURN = {
+  url: import.meta.env.VITE_TURN_URL,
+  username: import.meta.env.VITE_TURN_USERNAME,
+  credential: import.meta.env.VITE_TURN_CREDENTIAL
 };
 
 /**
@@ -53,8 +55,13 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
   socket,
   gameState,
   currentUserId,
+  iceServers,
   children
 }) => {
+  const iceConfiguration = useMemo(() => buildIceConfiguration(iceServers, STATIC_TURN), [iceServers]);
+  const iceConfigurationRef = useRef(iceConfiguration);
+  iceConfigurationRef.current = iceConfiguration;
+
   const answerer = gameState.players[gameState.activePlayerIndex];
   const answererId = answerer?.id ?? null;
   const readerId = resolveReaderId(gameState.players, gameState.activePlayerIndex);
@@ -88,6 +95,8 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
   // question" and must not be undone by the automatic start on the next render.
   const [needsManualStart, setNeedsManualStart] = useState(false);
   const [connectionWarning, setConnectionWarning] = useState<string | null>(null);
+  /** Connexions sortantes établies : les personnes qui nous voient vraiment. */
+  const [viewerCount, setViewerCount] = useState(0);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   /** One <video> per player we receive, keyed on their id. */
@@ -109,6 +118,11 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
   isRemoteMutedRef.current = isRemoteMuted;
   const socketRef = useRef<Socket | null>(socket);
   socketRef.current = socket;
+  // Les gestionnaires de signalisation vivent aussi longtemps que les rôles du
+  // tour, pas que la liste des joueurs : ils lisent celle-ci par une référence
+  // pour décider avec la table telle qu'elle est *maintenant*.
+  const playersRef = useRef(gameState.players);
+  playersRef.current = gameState.players;
 
   const media = useMemo(() => detectMediaAvailability(), []);
   const clientId = useMemo(() => getStableClientId(), []);
@@ -177,6 +191,11 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
       console.error('Error closing peer connection:', e);
     }
     map.current.delete(peerId);
+    refreshViewerCount();
+  };
+
+  const refreshViewerCount = () => {
+    setViewerCount(countLiveConnections(outboundConnections.current.values()));
   };
 
   /**
@@ -277,6 +296,10 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
       direction: 'inbound' | 'outbound'
     ) => {
       const handleState = () => {
+        // Le compteur « N personnes vous voient » suit chaque changement d'état,
+        // pas seulement les échecs : une offre n'est un spectateur qu'une fois
+        // la connexion établie.
+        if (direction === 'outbound') refreshViewerCount();
         const state = pc.connectionState || pc.iceConnectionState;
         if (state === 'connected' || state === 'completed') {
           setConnectionWarning(null);
@@ -309,7 +332,7 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
       try {
         closeConnection(inboundConnections, publisherId);
 
-        const pc = new RTCPeerConnection(ICE_SERVERS);
+        const pc = new RTCPeerConnection(iceConfigurationRef.current);
         inboundConnections.current.set(publisherId, pc);
 
         pc.ontrack = (event) => {
@@ -381,6 +404,14 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
       const connections = isOurStream ? outboundConnections : inboundConnections;
       const pending = isOurStream ? pendingOutboundCandidates : pendingInboundCandidates;
 
+      // Seuls les pairs légitimes ouvrent une file : un spectateur assis et
+      // connecté pour notre flux, un joueur à l'antenne pour le sien. Sans quoi
+      // chaque identifiant inventé créait une entrée de plus dans la table.
+      const isLegitimatePeer = isOurStream
+        ? isAllowedViewer(peerId, playersRef.current, currentUserId)
+        : peerId !== currentUserId && isPublisher(peerId);
+      if (!isLegitimatePeer) return;
+
       const pc = connections.current.get(peerId);
       if (pc?.remoteDescription) {
         try {
@@ -391,18 +422,24 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
         return;
       }
 
+      // File plafonnée : tant que la description distante n'est pas arrivée, un
+      // pair qui inonde de candidates faisait grossir la mémoire sans limite.
+      // Au-delà du plafond on ignore, une vraie connexion n'en a pas besoin.
       const queued = pending.current.get(peerId) ?? [];
-      queued.push(data.candidate);
+      enqueueBounded(queued, data.candidate);
       pending.current.set(peerId, queued);
     };
 
     const offerToViewer = async (viewerPlayerId: string) => {
       const stream = localStreamRef.current;
-      if (!isOnAir || !stream || viewerPlayerId === currentUserId) return;
+      if (!isOnAir || !stream) return;
+      // Notre caméra ne part que vers un joueur assis à la table et connecté,
+      // jamais vers un identifiant quelconque relayé jusqu'à nous.
+      if (!isAllowedViewer(viewerPlayerId, playersRef.current, currentUserId)) return;
 
       closeConnection(outboundConnections, viewerPlayerId);
 
-      const pc = new RTCPeerConnection(ICE_SERVERS);
+      const pc = new RTCPeerConnection(iceConfigurationRef.current);
       outboundConnections.current.set(viewerPlayerId, pc);
       stream.getTracks().forEach(track => pc.addTrack(track, stream));
       watchConnectionHealth(pc, viewerPlayerId, 'outbound');
@@ -479,6 +516,19 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
     // `publisherIds` is derived from the two ids below, so listing them is enough.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket, isCameraEnabled, isOnAir, currentUserId, gameState.roomCode, answererId, readerId]);
+
+  // Un spectateur qui quitte la table ou perd la connexion n'a plus à recevoir
+  // notre image : sa connexion sortante est fermée dès que l'état le dit, au
+  // lieu d'attendre que l'ICE finisse par expirer. Il la retrouvera, sous son
+  // nouvel identifiant, par le `webrtc-viewer-ready` de sa reconnexion.
+  useEffect(() => {
+    for (const viewerId of [...outboundConnections.current.keys()]) {
+      if (!isAllowedViewer(viewerId, gameState.players, currentUserId)) {
+        closeConnection(outboundConnections, viewerId);
+        pendingOutboundCandidates.current.delete(viewerId);
+      }
+    }
+  }, [gameState.players, currentUserId]);
 
   // Callback refs rather than effects keyed on the stream: the <video> elements
   // are remounted when a spotlight is collapsed and expanded again, and an
@@ -814,6 +864,7 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
     isVideoOff,
     toggleVideo,
     stopBroadcast: handleStopBroadcasting,
+    viewerCount,
     needsManualStart,
     startBroadcast: handleManualStart,
 

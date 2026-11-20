@@ -29,6 +29,11 @@ export interface LiveCameraContextValue {
   isVideoOff: boolean;
   toggleVideo: () => void;
   stopBroadcast: () => void;
+  /**
+   * Personnes dont la connexion à notre flux est établie. Affiché en permanence
+   * à la personne filmée : elle doit savoir, à tout instant, qui la voit.
+   */
+  viewerCount: number;
   needsManualStart: boolean;
   startBroadcast: () => void;
   /** Everyone we currently receive, at most the reader and the answerer. */
@@ -64,6 +69,7 @@ const DEFAULT_CONTEXT: LiveCameraContextValue = {
   isVideoOff: false,
   toggleVideo: NOOP,
   stopBroadcast: NOOP,
+  viewerCount: 0,
   needsManualStart: false,
   startBroadcast: NOOP,
   remoteParticipants: [],
