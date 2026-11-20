@@ -8,7 +8,10 @@ export default defineConfig(() => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        // `import.meta.dirname` plutôt que `__dirname` : Vite 8 prévient que le
+        // chargeur de configuration natif, appelé à devenir le défaut, n'injecte
+        // plus les variables CommonJS.
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {
