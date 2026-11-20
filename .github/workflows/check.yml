@@ -22,6 +22,9 @@ permissions:
 
 jobs:
   check:
+    # Une pull request ouverte depuis une branche du dépôt est déjà vérifiée par
+    # sa poussée : seule celle d'un fork a besoin de son propre passage.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       # Actions épinglées par empreinte : une étiquette se déplace, un SHA non.

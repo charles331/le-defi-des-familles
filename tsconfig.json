@@ -27,5 +27,8 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  // Sans liste explicite, tsc vérifiait aussi les copies de travail des agents
+  // (`.claude/worktrees/`) et les sorties de build.
+  "exclude": ["node_modules", "dist", "build", ".claude"]
 }

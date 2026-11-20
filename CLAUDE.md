@@ -8,7 +8,7 @@ code.
 ## Avant de livrer
 
 ```bash
-npm run check      # lint (tsc) + tests + audit des questions + build
+npm run check      # lint (tsc) + build + tests + audit des questions
 ```
 
 `npm run check` doit passer avant tout commit. Les commandes séparées :
@@ -259,11 +259,49 @@ Points de vigilance connus :
   réseau lui en donne un nouveau, donc tout ce qui est indexé dessus doit se
   déplacer d'un bloc : `room.sockets`, `room.reconnectTokens`, `room.hostSocketId`,
   les lancers de `firstPlayerDraw`. C'est le rôle de `bindSeatToSocket` dans
-  `server.ts` ; les trois chemins de retour (jeton de session, reprise par prénom
-  dans `join-room`, fusion par l'organisateur) passent tous par là. Un seul registre
+  `src/server/gameSocketServer.ts` ; les trois chemins de retour (jeton de session,
+  reprise par prénom dans `join-room`, fusion par l'organisateur) passent tous par là. Un seul registre
   oublié laisse un joueur visible à l'écran mais que le serveur n'autorise plus à
   agir. Le jeton de session vit dans le `localStorage` : il ne survit pas au
   changement de navigateur, d'où la reprise par prénom (`src/server/seats.ts`).
+
+## Sécurité : le client envoie ce qu'il veut
+
+Le jeu se joue en famille, avec des enfants, sur un serveur ouvert à tous. L'audit de
+novembre 2026 (ADR 0009) a montré qu'un seul paquet `create-room` vide tuait le
+processus, qu'un prénom suffisait à prendre la place de l'organisateur et que le
+lockfile de production portait une faille critique sans que rien ne le signale.
+Les règles qui en sortent :
+
+- **Tout handler socket passe par `on()`** dans `src/server/gameSocketServer.ts` :
+  `data` qui n'est pas un objet est écarté, une exception est journalisée au lieu de
+  tuer le processus. Un `socket.on` brut est une régression.
+- **Toute donnée client est validée avant d'entrer dans l'état** — et donc dans
+  `rooms.json`, rechargé à chaque redémarrage : une donnée invalide persistée est une
+  panne qui se rejoue. Les validateurs vivent dans `src/server/inputValidation.ts`
+  (prénom, avatar, couleur, niveau, réglages, cartes) ; un nouveau champ y ajoute le
+  sien, et `roomStore.loadRooms` revalide ce qu'il relit.
+- **Un siège ne se prend pas au prénom.** Le jeton de session rend sa place sans
+  question ; la reprise au prénom et l'arrivée en cours de partie demandent l'accord
+  de l'organisateur quand il est connecté (`src/server/seatRequests.ts`), et le siège
+  de l'organisateur ne se reprend jamais au prénom.
+- **Les questions d'un pack ne viennent jamais du client.** `/api/generate-pack`
+  range lui-même le pack validé dans le salon et ne renvoie que son nom et son
+  nombre de cartes ; `add-custom-pack` n'existe plus.
+- **Toute action relayée vérifie l'appartenance** (`room.sockets.has(socket.id)`) et
+  porte une limite de débit : les garde-fous (seau à jetons, essais de codes,
+  salons par adresse) sont dans `src/server/socketGuards.ts`.
+- **Une couleur de joueur ne s'interpole dans du CSS qu'à travers `safeCssColor`**
+  (`src/utils/motion.ts`) : une « couleur » contenant `url(...)` faisait charger une
+  image externe à toute la table.
+- **Le bundle serveur va dans `build/`**, jamais dans `dist/` qui est servi tel quel ;
+  `scripts/compress-dist.ts` fait échouer le build si un fichier privé y apparaît.
+- La CSP et les en-têtes vivent dans `src/server/httpSecurity.ts`. Une nouvelle
+  ressource externe (police, image, script) est refusée par le navigateur tant que la
+  CSP ne la nomme pas : c'est voulu.
+- Les dépendances s'installent avec **bun** depuis `bun.lock`, le lockfile que Railway
+  déploie ; la CI bloque sur `bun audit`. `npm audit` ne voit pas les versions de
+  production et ne prouve rien.
 
 ## Le nom du jeu vit dans une constante
 
