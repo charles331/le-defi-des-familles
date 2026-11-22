@@ -191,7 +191,9 @@ export function removePlayerFromGame(state: GameState, playerId: string): boolea
     state.activePlayerIndex = 0;
   }
 
-  if (wasActive && state.phase !== 'lobby' && state.phase !== 'game_over') {
+  // Pendant le tirage du premier joueur, personne n'a encore la main : il n'y a
+  // pas de tour à remettre au lancer.
+  if (wasActive && !['lobby', 'first_player_roll', 'game_over'].includes(state.phase)) {
     state.phase = 'rolling';
     state.diceValue = null;
     state.diceThrow = null;
@@ -205,6 +207,7 @@ export function removePlayerFromGame(state: GameState, playerId: string): boolea
     state.surpriseWheel = null;
     state.activeQuestionBonus = null;
     state.bigLeapThisTurn = null;
+    state.readerId = undefined;
   }
 
   return true;

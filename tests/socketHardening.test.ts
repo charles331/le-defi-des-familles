@@ -653,3 +653,17 @@ test('le lecteur coupé garde sa carte : le spectateur ne reçoit pas la solutio
   assert.equal(room.gameState.readerId, back.id);
   assert.equal(payload.gameState.currentQuestion.correctAnswerIndex, 0);
 });
+
+test('le joueur actif qui quitte le salon ne laisse pas sa carte, solution comprise, à son lecteur', async () => {
+  const { host, guest, roomCode, room } = await questionForLaura({
+    format: 'mcq',
+    options: ['Le Mayflower', 'La Santa Maria', 'Le Titanic', 'Le Bounty'],
+  });
+  room.gameState.readerId = host.id!;
+  const update = next(host, 'game-state-update');
+  guest.emit('leave-room', { roomCode });
+  const state = await update;
+  assert.equal(state.phase, 'rolling');
+  assert.equal(state.currentQuestion, null);
+  assert.equal(room.gameState.players.length, 1);
+});

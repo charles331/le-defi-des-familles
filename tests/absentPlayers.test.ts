@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ABSENT_TURN_GRACE_MS, handOverAbsentReader, skipAbsentActivePlayer } from '../src/server/absentPlayers';
-import { advanceTurn } from '../src/server/gameEngine';
+import { advanceTurn, removePlayerFromGame } from '../src/server/gameEngine';
 import { createGameStateView } from '../src/server/gameStateView';
 import { cardReaderId, READER_RECONNECT_GRACE_MS, resolveLiveRole, resolveOnAirIds } from '../src/server/turnRoles';
 import { createGameState, createPlayer, testSettings } from './fixtures';
@@ -128,4 +128,30 @@ test('une coupure sans date n’est jamais tranchée sur-le-champ', () => {
   assert.equal(skipAbsentActivePlayer(state, NOW), false);
   state.players[1].isConnected = false;
   assert.equal(handOverAbsentReader(readAloudCard({ players: state.players }), NOW), false);
+});
+
+test('le lecteur fixé ne devient jamais celui qui répond', () => {
+  // Bob lisait pour Alice ; Alice quitte la table et Bob se retrouve à l'index
+  // actif : il ne doit pas recevoir la solution de la carte qu'il lisait.
+  const state = readAloudCard({
+    players: [createPlayer('bob'), createPlayer('alice')],
+    activePlayerIndex: 0,
+    readerId: 'bob',
+  });
+  assert.equal(cardReaderId(state), 'alice');
+  assert.equal(createGameStateView(state, 'bob', 'bob').currentQuestion?.correctAnswerIndex, undefined);
+});
+
+test('le joueur actif qui quitte la table emporte sa carte et son lecteur', () => {
+  const state = readAloudCard({ players: [createPlayer('bob'), createPlayer('alice')], activePlayerIndex: 1 });
+  removePlayerFromGame(state, 'alice');
+  assert.equal(state.phase, 'rolling');
+  assert.equal(state.currentQuestion, null);
+  assert.equal(state.readerId, undefined);
+});
+
+test('un départ pendant le tirage du premier joueur ne lance pas la partie', () => {
+  const state = readAloudCard({ phase: 'first_player_roll', activePlayerIndex: 0 });
+  removePlayerFromGame(state, 'chloe');
+  assert.equal(state.phase, 'first_player_roll');
 });
