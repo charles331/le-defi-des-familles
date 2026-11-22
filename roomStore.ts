@@ -291,6 +291,9 @@ export function reviveStoredRoom(
   for (const raw of storedState.players) {
     const player = reviveStoredPlayer(raw);
     if (!player) return null;
+    // Personne n'est encore revenu : chacun dispose du même délai, à compter du
+    // redémarrage, avant que son rôle de lecteur ou son tour ne passe.
+    player.disconnectedAt = now;
     players.push(player);
   }
 
@@ -350,6 +353,13 @@ export function reviveStoredRoom(
       phase,
       currentQuestion,
       activePlayerIndex,
+      // Le lecteur fixé de la carte en cours, s'il désigne toujours un joueur du
+      // salon ; sinon le rôle se déduit de l'ordre de la table.
+      readerId: storedState.readerId === null
+        ? null
+        : players.some(player => player.id === storedState.readerId)
+          ? storedState.readerId
+          : undefined,
       settings,
       players,
       customPacks,

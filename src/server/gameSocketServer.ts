@@ -41,7 +41,8 @@ import {
 import { generateRoomCode, normalizeRoomCode } from './roomCodes';
 import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin, safeTokenEquals } from './socketGuards';
 import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
-import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './turnRoles';
+import { cardReaderId, isCardReadAloud, READER_RECONNECT_GRACE_MS, resolveOnAirIds, resolveReaderId } from './turnRoles';
+import { ABSENT_TURN_GRACE_MS, handOverAbsentReader, skipAbsentActivePlayer } from './absentPlayers';
 import { pickQuestionForPlayer } from './questionSelection';
 import {
   BIG_LEAP_BONUS,
@@ -304,7 +305,10 @@ export function attachGameSocketServer(
   function bindSeatToSocket(room: Room, seat: Player, previousSeatId: string, socket: Socket, sessionToken: string): void {
     seat.id = socket.id;
     seat.isConnected = true;
+    seat.disconnectedAt = null;
     transferFirstPlayerRoll(room.gameState, previousSeatId, socket.id);
+    // Le lecteur de la carte revenu à temps la retrouve sous sa nouvelle connexion.
+    if (room.gameState.readerId === previousSeatId) room.gameState.readerId = socket.id;
 
     room.sockets.delete(previousSeatId);
     room.sockets.set(socket.id, seat);
@@ -353,9 +357,38 @@ export function attachGameSocketServer(
     }
   }
 
+  /**
+   * Applique les règles des absents (`absentPlayers.ts`) : le lecteur parti trop
+   * longtemps cède son rôle, le joueur actif parti trop longtemps son tour.
+   */
+  function settleAbsentPlayers(room: Room, now = Date.now()): void {
+    if (!rooms.has(room.code) || room.gameState.isPaused) return;
+    const readerChanged = handOverAbsentReader(room.gameState, now);
+    const turnSkipped = skipAbsentActivePlayer(room.gameState, now);
+    if (!readerChanged && !turnSkipped) return;
+    if (readerChanged) console.log(`[Room] ${room.code} : le lecteur absent cède son rôle.`);
+    if (turnSkipped) console.log(`[Room] ${room.code} : le joueur actif absent passe son tour.`);
+    emitGameState(room);
+    persist();
+  }
+
+  /** Échéances des délais de retour, une par coupure. */
+  const absenceTimers = new Set<ReturnType<typeof setTimeout>>();
+  function scheduleAbsenceCheck(room: Room, delayMs: number): void {
+    const timer = setTimeout(() => {
+      absenceTimers.delete(timer);
+      settleAbsentPlayers(room);
+    }, delayMs + 50);
+    timer.unref?.();
+    absenceTimers.add(timer);
+  }
+
   const roomSweep = setInterval(() => {
     const now = Date.now();
     for (const [code, room] of rooms.entries()) {
+      // Filet des échéances : après un redémarrage ou une pause, aucune minuterie
+      // ne court, et c'est ce balayage qui finit par trancher.
+      settleAbsentPlayers(room, now);
       // Une partie en pause échappe aux délais courts : ni l'absence de
       // l'organisateur ni un salon vide ne la ferment. Seule la fenêtre de pause
       // la limite, afin qu'un salon oublié ne reste pas indéfiniment ouvert —
@@ -1258,7 +1291,7 @@ export function attachGameSocketServer(
       if (isPlayerAllowedToAct(room, socketId)) return true;
       if (!isCardReadAloud(room.settings)) return false;
 
-      return resolveReaderId(room.gameState.players, room.gameState.activePlayerIndex) === socketId;
+      return cardReaderId(room.gameState) === socketId;
     }
 
     /**
@@ -1412,6 +1445,9 @@ export function attachGameSocketServer(
       // finir de lire le « Le saviez-vous ? ».
       room.gameState.lastQuestionRecap = null;
       room.gameState.phase = 'question';
+      // Le lecteur est fixé pour toute la carte : une coupure ne doit pas faire
+      // passer la solution à un autre joueur (`absentPlayers.ts`).
+      room.gameState.readerId = resolveReaderId(room.gameState.players, room.gameState.activePlayerIndex);
       // Sur une case Surprise, le minuteur ne démarre pas tout de suite : la roue
       // doit d'abord tourner. On laisse `questionStartTime` en attente (null) et
       // c'est le joueur actif qui lance le décompte en fermant la roue, via
@@ -1574,7 +1610,8 @@ export function attachGameSocketServer(
     const isOnAir = (room: Room, socketId: string) =>
       room.settings.enableLiveCamera === true
       && room.gameState.phase === 'question'
-      && resolveOnAirIds(room.gameState.players, room.gameState.activePlayerIndex).includes(socketId);
+      && resolveOnAirIds(room.gameState.players, room.gameState.activePlayerIndex, cardReaderId(room.gameState))
+        .includes(socketId);
 
     on('webrtc-broadcaster-ready', (data: { roomCode: string }) => {
       const room = getRoom(data.roomCode, socket.id);
@@ -1683,6 +1720,10 @@ export function attachGameSocketServer(
           const p = room.gameState.players.find(pl => pl.id === socket.id);
           if (p) {
             p.isConnected = false;
+            p.disconnectedAt = Date.now();
+            // Le lecteur et le joueur actif ont chacun un délai pour revenir.
+            scheduleAbsenceCheck(room, READER_RECONNECT_GRACE_MS);
+            scheduleAbsenceCheck(room, ABSENT_TURN_GRACE_MS);
             // On n'attend plus le lancer d'un absent : si les présents ont tous
             // lancé, le tirage se tranche tout de suite.
             settleFirstPlayerDraw(room.gameState);
@@ -1706,6 +1747,7 @@ export function attachGameSocketServer(
     emitGameState,
     close: () => new Promise<void>((resolve) => {
       clearInterval(roomSweep);
+      for (const timer of absenceTimers) clearTimeout(timer);
       for (const timer of seatRequestTimers.values()) clearTimeout(timer);
       io.close(() => resolve());
     }),

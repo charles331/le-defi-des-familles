@@ -1,5 +1,5 @@
 import { GameState, Question } from '../types';
-import { isCardReadAloud, resolveReaderId } from './turnRoles';
+import { cardReaderId, isCardReadAloud } from './turnRoles';
 
 export interface PublicQuestion extends Omit<Question, 'correctAnswerIndex' | 'explanation' | 'answer'> {
   correctAnswerIndex?: number;
@@ -24,7 +24,7 @@ export function isDesignatedReader(state: GameState, socketId: string, hostSocke
   if (!isCardReadAloud(state.settings) || state.players.length === 0) return false;
   if (state.settings.isLocalMode) return socketId === hostSocketId;
 
-  return resolveReaderId(state.players, state.activePlayerIndex) === socketId;
+  return cardReaderId(state) === socketId;
 }
 
 /**

@@ -3,7 +3,7 @@ import { Socket } from 'socket.io-client';
 import { GameState } from '../types';
 import { Camera, ShieldCheck, AlertTriangle } from 'lucide-react';
 import { LiveCameraContext, LiveCameraContextValue, RemoteParticipant } from '../contexts/liveCamera';
-import { resolveLiveRole, resolveOnAirIds, resolveReaderId } from '../server/turnRoles';
+import { cardReaderId, resolveLiveRole, resolveOnAirIds } from '../server/turnRoles';
 import {
   BROADCAST_CONSTRAINTS,
   PERMISSION_PROBE_CONSTRAINTS,
@@ -64,13 +64,15 @@ export const LiveCameraProvider: React.FC<LiveCameraOverlayProps & { children?: 
 
   const answerer = gameState.players[gameState.activePlayerIndex];
   const answererId = answerer?.id ?? null;
-  const readerId = resolveReaderId(gameState.players, gameState.activePlayerIndex);
-  const myRole = resolveLiveRole(gameState.players, gameState.activePlayerIndex, currentUserId);
+  // Le lecteur fixé par le serveur pour la carte : il reste à l'antenne le temps
+  // de revenir d'une coupure, au lieu que le rôle saute chez un autre joueur.
+  const readerId = cardReaderId(gameState);
+  const myRole = resolveLiveRole(gameState.players, gameState.activePlayerIndex, currentUserId, readerId);
   const isOnAir = myRole !== 'spectator';
   const isCameraEnabled = gameState.settings.enableLiveCamera ?? false;
 
   // The players whose stream we expect to receive: everyone on air but us.
-  const publisherIds = resolveOnAirIds(gameState.players, gameState.activePlayerIndex)
+  const publisherIds = resolveOnAirIds(gameState.players, gameState.activePlayerIndex, readerId)
     .filter(id => id !== currentUserId);
   // Nobody left to talk to: never light the camera up just to film ourselves.
   const hasAudience = gameState.players.some(

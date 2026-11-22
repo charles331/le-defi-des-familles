@@ -112,6 +112,7 @@ export function advanceTurn(state: GameState): void {
   state.surpriseWheel = null;
   state.activeQuestionBonus = null;
   state.bigLeapThisTurn = null;
+  state.readerId = undefined;
 }
 
 /**
