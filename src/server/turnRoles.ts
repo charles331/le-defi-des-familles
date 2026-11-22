@@ -35,6 +35,17 @@ export function isCardReadAloud(
   return settings.isReaderMode === true || settings.enableLiveCamera === true;
 }
 
+/**
+ * Laps laissé au lecteur d'une carte pour revenir après une coupure — le temps
+ * d'un rechargement de page ou d'un écran qui se rallume —, avant que le rôle ne
+ * passe au joueur suivant.
+ *
+ * Le rôle suivait jusqu'ici la connexion à la seconde près : la moindre coupure
+ * du lecteur envoyait la solution à un autre joueur, qui la gardait ensuite, et
+ * un arrêt du serveur suffisait à la faire circuler autour de la table.
+ */
+export const READER_RECONNECT_GRACE_MS = 20_000;
+
 /** Minimal player shape needed to resolve roles. */
 export interface TurnRolePlayer {
   id: string;
@@ -76,6 +87,36 @@ export function resolveReaderId(
   return index === null ? null : players[index]?.id ?? null;
 }
 
+/** Ce que `cardReaderId` lit de l'état de la partie. */
+export interface CardReaderState {
+  players: readonly TurnRolePlayer[];
+  activePlayerIndex: number;
+  phase?: string;
+  readerId?: string | null;
+}
+
+/**
+ * Le lecteur de la carte en cours, celui qui reçoit la solution.
+ *
+ * Pendant une carte (`question`, puis `evaluating`), c'est celui que le serveur a
+ * fixé en la tirant, même s'il vient de perdre la connexion : il garde son rôle le
+ * temps de revenir (`READER_RECONNECT_GRACE_MS`), et personne d'autre ne reçoit la
+ * solution entre-temps. Le serveur passe ensuite le rôle au suivant
+ * (`absentPlayers.ts`). Hors d'une carte, ou pour un état enregistré avant ce
+ * champ, le rôle se déduit de l'ordre de la table.
+ *
+ * Serveur et écrans lisent ce même champ : ils ne peuvent pas diverger.
+ */
+export function cardReaderId(state: CardReaderState): string | null {
+  const duringCard = state.phase === 'question' || state.phase === 'evaluating';
+  if (duringCard && state.readerId !== undefined) {
+    if (state.readerId === null) return null;
+    // Un lecteur retiré de la partie n'a plus de place : l'ordre de la table reprend.
+    if (state.players.some(player => player.id === state.readerId)) return state.readerId;
+  }
+  return resolveReaderId(state.players, state.activePlayerIndex);
+}
+
 /**
  * The part a given player takes in the current turn.
  *
@@ -86,10 +127,11 @@ export function resolveLiveRole(
   players: readonly TurnRolePlayer[],
   activePlayerIndex: number,
   playerId: string | null | undefined,
+  readerId: string | null = resolveReaderId(players, activePlayerIndex),
 ): LiveRole {
   if (!playerId) return 'spectator';
   if (players[activePlayerIndex]?.id === playerId) return 'answerer';
-  return resolveReaderId(players, activePlayerIndex) === playerId ? 'reader' : 'spectator';
+  return readerId === playerId ? 'reader' : 'spectator';
 }
 
 /**
@@ -102,8 +144,8 @@ export function resolveLiveRole(
 export function resolveOnAirIds(
   players: readonly TurnRolePlayer[],
   activePlayerIndex: number,
+  readerId: string | null = resolveReaderId(players, activePlayerIndex),
 ): string[] {
   const answererId = players[activePlayerIndex]?.id ?? null;
-  const readerId = resolveReaderId(players, activePlayerIndex);
   return [answererId, readerId].filter((id): id is string => typeof id === 'string');
 }

@@ -254,11 +254,15 @@ Points de vigilance connus :
   solution aux clients qui ne doivent pas la voir. Toute donnée sensible ajoutée à
   `GameState` doit y être filtrée.
 - Les rôles du tour (qui répond, qui lit la carte) se résolvent dans
-  `src/server/turnRoles.ts`, en sautant les joueurs déconnectés.
+  `src/server/turnRoles.ts`, en sautant les joueurs déconnectés. Pendant une
+  carte, le lecteur est **fixé** au tirage (`gameState.readerId`, lu par
+  `cardReaderId` côté serveur comme côté écrans) : une coupure ne fait pas passer
+  la solution à un autre joueur. `src/server/absentPlayers.ts` passe le rôle de
+  lecteur après 20 s d'absence, et le tour du joueur actif après 60 s.
 - **L'identifiant d'un joueur *est* son identifiant de socket.** Une coupure de
   réseau lui en donne un nouveau, donc tout ce qui est indexé dessus doit se
   déplacer d'un bloc : `room.sockets`, `room.reconnectTokens`, `room.hostSocketId`,
-  les lancers de `firstPlayerDraw`. C'est le rôle de `bindSeatToSocket` dans
+  les lancers de `firstPlayerDraw`, le lecteur fixé `readerId`. C'est le rôle de `bindSeatToSocket` dans
   `src/server/gameSocketServer.ts` ; les trois chemins de retour (jeton de session,
   reprise par prénom dans `join-room`, fusion par l'organisateur) passent tous par là. Un seul registre
   oublié laisse un joueur visible à l'écran mais que le serveur n'autorise plus à

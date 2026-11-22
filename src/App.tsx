@@ -16,7 +16,7 @@ import { InGameHeader } from './components/InGameHeader';
 import { LiveChat } from './components/LiveChat';
 import { LiveCameraStatusBar } from './components/LiveSpotlight';
 import { LastQuestionRecap } from './components/LastQuestionRecap';
-import { isCardReadAloud } from './server/turnRoles';
+import { cardReaderId, isCardReadAloud } from './server/turnRoles';
 import { questionRevealDelayMs, usePrefersReducedMotion } from './utils/motion';
 
 const VictoryModal = React.lazy(() =>
@@ -539,6 +539,7 @@ export default function App() {
             isReaderMode={readAloud}
             isLocalMode={gameState.settings.isLocalMode}
             allPlayers={gameState.players}
+            readerId={cardReaderId(gameState)}
             currentUserId={currentUserId}
             onSubmitAnswer={handleSubmitAnswer}
             onUseBonus={handleUseBonus}
@@ -568,6 +569,7 @@ export default function App() {
             isReaderMode={readAloud}
             isLocalMode={gameState.settings.isLocalMode}
             allPlayers={gameState.players}
+            readerId={cardReaderId(gameState)}
             currentUserId={currentUserId}
             onSubmitAnswer={handleSubmitAnswer}
             onUseBonus={handleUseBonus}

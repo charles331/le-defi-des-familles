@@ -87,6 +87,12 @@ export interface Player {
   correctAnswersCount: number;
   totalAnswersCount: number;
   isConnected: boolean;
+  /**
+   * Instant de la dernière coupure, tant que la place attend son retour. Le
+   * serveur s'en sert pour laisser quelques secondes à un rechargement de page
+   * avant de confier le rôle de lecteur à un autre, ou de passer le tour.
+   */
+  disconnectedAt?: number | null;
   /** Bonus gagnés et conservés jusqu'à ce que le joueur décide de les utiliser. */
   bonuses?: PlayerBonuses;
 }
@@ -192,6 +198,11 @@ export interface GameState {
   boardCategories?: CategoryId[];
   roomCode: string;
   phase: GamePhase;
+  /**
+   * Le lecteur de la carte en cours, fixé quand elle est tirée (`turnRoles.ts`).
+   * Absent hors d'une carte : le rôle se déduit alors de l'ordre de la table.
+   */
+  readerId?: string | null;
   settings: GameSettings;
   players: Player[];
   activePlayerIndex: number;

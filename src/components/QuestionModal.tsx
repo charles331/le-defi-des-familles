@@ -17,6 +17,11 @@ const WHEEL_SPIN_MS = 3500;
 
 interface QuestionModalProps {
   question: Question;
+  /**
+   * Le lecteur de la carte, tel que le serveur l'a fixé (`cardReaderId`). Absent,
+   * il se déduit de l'ordre de la table.
+   */
+  readerId?: string | null;
   activePlayer: Player;
   timerSeconds: number;
   questionStartTime?: number | null;
@@ -58,6 +63,7 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
   isReaderMode = false,
   isLocalMode = false,
   allPlayers = [],
+  readerId: pinnedReaderId,
   currentUserId,
   onSubmitAnswer,
   onUseBonus,
@@ -101,10 +107,18 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
   const isIActivePlayer = !localReaderReady && (isMyTurn || (currentUserId ? activePlayer.id === currentUserId : false) || activePlayer.id.startsWith('local_'));
 
   // The reader is the player seated just *before* the one being questioned, so
-  // the card is handed over in table order. `resolveReaderId` is the same helper
-  // the server uses to decide who receives the solution.
+  // the card is handed over in table order. The server pins them when the card
+  // is drawn (`cardReaderId`) and that is who receives the solution; the local
+  // fallback only serves states that predate the field.
   const activeIndex = allPlayers.findIndex(p => p.id === activePlayer.id);
-  const readerId = activeIndex >= 0 ? resolveReaderId(allPlayers, activeIndex) : null;
+  const readerId = pinnedReaderId !== undefined
+    ? pinnedReaderId
+    : activeIndex >= 0 ? resolveReaderId(allPlayers, activeIndex) : null;
+  // Le lecteur vient de perdre la connexion : la table l'attend quelques
+  // secondes avant que le rôle ne passe au joueur suivant.
+  const isReaderAway = Boolean(
+    readerId && allPlayers.find(p => p.id === readerId)?.isConnected === false,
+  );
   const readerPlayer = allPlayers.find(p => p.id === readerId) ?? activePlayer;
 
   // Determine if current client is the designated Reader (MUST be a non-active player when Reader Mode is ENABLED).
@@ -472,7 +486,11 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
         {isReaderMode && readerId !== null && !isAnswered && (
           <div className="flex shrink-0 items-center gap-1.5 border-b border-amber-500/30 bg-amber-500/15 px-3 py-1.5 text-[11px] font-bold leading-snug text-amber-900 dark:text-amber-200">
             <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-500" />
-            {isIActivePlayer ? (
+            {isReaderAway ? (
+              <span className="min-w-0">
+                <strong>{readerPlayer.name}</strong> a perdu la connexion. On l’attend quelques secondes, puis un autre joueur lira la carte.
+              </span>
+            ) : isIActivePlayer ? (
               <span className="min-w-0">
                 <strong>{readerPlayer.name}</strong> vous lit la carte à voix haute.
               </span>
@@ -638,8 +656,8 @@ export const QuestionModal: React.FC<QuestionModalProps> = ({
           )}
 
           {/* Filet de sécurité : une carte ouverte se juge par un lecteur, qui
-              seul reçoit la réponse. `resolveReaderId` bascule déjà le rôle vers
-              le joueur connecté suivant si le lecteur se déconnecte. Mais s'il
+              seul reçoit la réponse. Le serveur passe le rôle au joueur connecté
+              suivant si le lecteur ne revient pas à temps (`absentPlayers.ts`). Mais s'il
               ne reste plus aucun autre joueur connecté, personne ne peut valider
               et, sans minuteur, la carte se bloquerait. Le joueur actif peut
               alors la passer (comptée manquée) au lieu de rester coincé. */}

@@ -608,3 +608,48 @@ test('admis en cours de partie, un joueur compte comme prêt pour « Rejouer »'
   host.emit('answer-seat-request', { roomCode, requestId: request.id, accept: true });
   assert.equal((await joined).player.isReady, true);
 });
+
+test('le lecteur coupé garde sa carte : le spectateur ne reçoit pas la solution, le lecteur revenu si', async () => {
+  const host = await client();
+  const created = await createRoom(host, 'Charles');
+  const { roomCode } = created;
+  const room = rooms.get(roomCode)!;
+  const laura = await client();
+  const lauraJoined = next(laura, 'room-joined');
+  laura.emit('join-room', { roomCode, player: { name: 'Laura' } });
+  await lauraJoined;
+  const zoe = await client();
+  const zoeJoined = next(zoe, 'room-joined');
+  zoe.emit('join-room', { roomCode, player: { name: 'Zoé' } });
+  await zoeJoined;
+  await new Promise(resolve => setTimeout(resolve, 100));
+
+  // Laura répond, Charles — assis juste avant elle — lit, Zoé regarde.
+  room.settings.isReaderMode = true;
+  room.gameState.phase = 'question';
+  room.gameState.activePlayerIndex = 1;
+  room.gameState.readerId = host.id!;
+  room.gameState.currentQuestion = {
+    id: 'q_test',
+    categoryId: 'histoire',
+    question: 'Quel navire a conduit les Pères pèlerins en Amérique ?',
+    options: ['Le Mayflower', 'La Santa Maria', 'Le Titanic', 'Le Bounty'],
+    correctAnswerIndex: 0,
+    difficulty: 'ado',
+  };
+
+  // Charles perd la connexion : Zoé devenait aussitôt lectrice et recevait la solution.
+  const seenByZoe = next(zoe, 'game-state-update');
+  host.disconnect();
+  const afterDrop = await seenByZoe;
+  assert.equal(afterDrop.readerId, created.player.id);
+  assert.equal(afterDrop.currentQuestion.correctAnswerIndex, undefined);
+
+  // Il revient avec sa session : il retrouve son rôle et la solution.
+  const back = await client();
+  const rejoined = next(back, 'room-joined');
+  back.emit('reconnect-session', { roomCode, playerId: created.player.id, sessionToken: created.sessionToken });
+  const payload = await rejoined;
+  assert.equal(room.gameState.readerId, back.id);
+  assert.equal(payload.gameState.currentQuestion.correctAnswerIndex, 0);
+});
