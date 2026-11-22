@@ -50,12 +50,20 @@ export function judgeAnswer({
     return { accepted: false, reason: 'Seul le lecteur peut valider une carte ouverte.' };
   }
 
-  // Le minuteur, appliqué par le serveur. Trois cas où il ne s'applique pas :
-  // aucun minuteur (0), décompte pas encore lancé (roue surprise), et le mode
-  // lecteur du pass & play, où le décompte démarre sur l'appareil quand le
-  // lecteur se déclare prêt — le serveur n'en connaît pas l'instant.
+  // Le minuteur, appliqué par le serveur. Deux cas où il ne s'applique pas :
+  // aucun minuteur (0), et le mode lecteur du pass & play, où le décompte
+  // démarre sur l'appareil quand le lecteur se déclare prêt — le serveur n'en
+  // connaît pas l'instant.
   const timerSeconds = settings.timerSeconds;
   const localCountdown = settings.isLocalMode === true && isCardReadAloud(settings);
+
+  // Roue surprise : le décompte n'est lancé que par « start-question-timer ».
+  // Accepter une réponse avant revenait à jouer sans échéance — il suffisait de
+  // ne jamais envoyer cet événement. Seul « Passer » reste possible.
+  if (optionIndex !== -1 && timerSeconds > 0 && questionStartTime === null && !localCountdown) {
+    return { accepted: false, reason: 'Le minuteur de la carte n’a pas encore démarré.' };
+  }
+
   if (
     optionIndex !== -1
     && timerSeconds > 0

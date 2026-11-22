@@ -33,10 +33,9 @@ test('une réponse après le minuteur et sa marge compte comme un temps écoulé
   assert.deepEqual(judgeAnswer({ ...base, now: deadline + 1 }), { accepted: true, optionIndex: -1, late: true });
 });
 
-test('sans minuteur, roue en cours ou décompte local, pas d’échéance serveur', () => {
+test('sans minuteur ou décompte local, pas d’échéance serveur', () => {
   const base = { question: mcq, optionIndex: 2, isReader: false, questionStartTime: 0 as number | null, now: 10 * 60_000 };
   assert.deepEqual(judgeAnswer({ ...base, settings: { ...online, timerSeconds: 0 } }), { accepted: true, optionIndex: 2, late: false });
-  assert.deepEqual(judgeAnswer({ ...base, settings: online, questionStartTime: null }), { accepted: true, optionIndex: 2, late: false });
   // Pass & play en mode lecteur : le décompte part quand le lecteur est prêt,
   // sur l'appareil, à un instant que le serveur ignore.
   assert.deepEqual(
@@ -58,4 +57,20 @@ test('le lecteur désigné : le joueur d’avant en ligne, l’organisateur en p
   assert.ok(isDesignatedReader(state, 'host', 'host'));
   state.settings = { ...online, isReaderMode: false };
   assert.ok(!isDesignatedReader(state, 'host', 'host'));
+});
+
+test('roue surprise : pas de réponse avant que le minuteur ne démarre, seulement « Passer »', () => {
+  const base = { question: mcq, isReader: false, questionStartTime: null as number | null, now: 10 * 60_000 };
+  // Sans « start-question-timer », la carte se jouait sans aucune échéance.
+  const verdict = judgeAnswer({ ...base, optionIndex: 2, settings: online });
+  assert.equal(verdict.accepted, false);
+  assert.deepEqual(judgeAnswer({ ...base, optionIndex: -1, settings: online }), { accepted: true, optionIndex: -1, late: false });
+  // Sans minuteur, rien à attendre.
+  assert.deepEqual(
+    judgeAnswer({ ...base, optionIndex: 2, settings: { ...online, timerSeconds: 0 } }),
+    { accepted: true, optionIndex: 2, late: false },
+  );
+  // Une fois lancé, l'échéance s'applique comme ailleurs.
+  const late = judgeAnswer({ ...base, optionIndex: 2, settings: online, questionStartTime: 0 });
+  assert.deepEqual(late, { accepted: true, optionIndex: -1, late: true });
 });
