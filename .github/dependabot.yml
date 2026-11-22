@@ -1,0 +1,40 @@
+# Mises à jour des dépendances, proposées en pull request et vérifiées par la CI
+# avant toute fusion (main est protégée).
+#
+# Les correctifs de sécurité n'attendent pas ce calendrier : GitHub ouvre une PR
+# dès qu'une faille touche une version de `bun.lock`, en plus de `bun audit` qui
+# bloque la CI. Ce fichier règle le reste : une PR groupée par semaine.
+version: 2
+updates:
+  # `bun.lock` est la seule source de versions : c'est lui que Railway déploie.
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Europe/Brussels
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'Dépendances'
+    groups:
+      # Mineures et correctifs ensemble : une seule PR à relire par semaine.
+      # Les majeures restent à part, une par paquet : elles cassent plus souvent.
+      mineures-et-correctifs:
+        update-types: [minor, patch]
+    ignore:
+      # Les types Node suivent la version du runtime (Node 22), pas la dernière.
+      - dependency-name: '@types/node'
+        update-types: [version-update:semver-major]
+
+  # Les actions de la CI sont épinglées par empreinte : Dependabot met à jour le
+  # SHA et son commentaire de version ensemble.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: 'CI'
+    groups:
+      actions:
+        patterns: ['*']
