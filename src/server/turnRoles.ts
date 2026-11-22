@@ -111,8 +111,13 @@ export function cardReaderId(state: CardReaderState): string | null {
   const duringCard = state.phase === 'question' || state.phase === 'evaluating';
   if (duringCard && state.readerId !== undefined) {
     if (state.readerId === null) return null;
-    // Un lecteur retiré de la partie n'a plus de place : l'ordre de la table reprend.
-    if (state.players.some(player => player.id === state.readerId)) return state.readerId;
+    // Un lecteur retiré de la partie n'a plus de place : l'ordre de la table
+    // reprend. Et celui qui répond ne lit jamais sa propre carte, quoi que dise
+    // le champ : ce serait lui donner la solution.
+    const answererId = state.players[state.activePlayerIndex]?.id;
+    if (state.readerId !== answererId && state.players.some(player => player.id === state.readerId)) {
+      return state.readerId;
+    }
   }
   return resolveReaderId(state.players, state.activePlayerIndex);
 }

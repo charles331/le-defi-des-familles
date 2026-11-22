@@ -329,14 +329,10 @@ export function attachGameSocketServer(
   function removeSocketFromRoom(room: Room, socketId: string): void {
     room.sockets.delete(socketId);
     room.reconnectTokens.delete(socketId);
-    const playerIndex = room.gameState.players.findIndex(player => player.id === socketId);
-    if (playerIndex >= 0) {
-      room.gameState.players.splice(playerIndex, 1);
-      if (room.gameState.activePlayerIndex >= room.gameState.players.length) {
-        room.gameState.activePlayerIndex = 0;
-      } else if (playerIndex < room.gameState.activePlayerIndex) {
-        room.gameState.activePlayerIndex -= 1;
-      }
+    // Même retrait que « remove-player » : un joueur actif qui part emporte sa
+    // carte, au lieu de la laisser — solution comprise, s'il s'agissait de son
+    // lecteur — au joueur qui prend sa place dans l'ordre de la table.
+    if (removePlayerFromGame(room.gameState, socketId)) {
       // Un départ pendant le tirage retire le lancer du partant, et peut suffire à
       // départager ceux qui restent.
       purgeFirstPlayerRoll(room.gameState, socketId);
