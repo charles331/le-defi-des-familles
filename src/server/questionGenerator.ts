@@ -46,9 +46,15 @@ export function sanitizeThemeName(raw: string): string {
     .trim()
     .slice(0, MAX_THEME_NAME_LENGTH);
 }
-// La génération de quiz est un travail équilibré qualité/coût : Terra est plus
-// adapté que le modèle Sol, orienté vers les tâches les plus difficiles.
-const DEFAULT_OPENAI_MODEL = 'gpt-5.6-terra';
+// Le compte OpenAI du projet a un palier gratuit quotidien, bien plus large
+// pour la famille « mini » (2,5 millions de tokens) que pour les grands modèles
+// (250 000, une dizaine de thèmes). Le mini écrit des cartes que le contrôle
+// éditorial de packAssembly trie de toute façon ; `OPENAI_MODEL` permet d'en
+// changer — et alors `MAX_AI_TOKENS_PER_DAY` avec lui.
+const DEFAULT_OPENAI_MODEL = 'gpt-5.4-mini';
+// Écrire quinze cartes de quiz ne demande pas de longue réflexion, et les
+// tokens de raisonnement sont facturés comme les autres.
+const DEFAULT_OPENAI_REASONING_EFFORT = 'low';
 
 const CARD_JSON_SCHEMA = {
   type: 'object',
@@ -140,7 +146,9 @@ export const OPENAI_PACK_SCHEMA = {
 export function resolveAiProviderConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): AiProviderConfig {
-  const rawProvider = (env.AI_PROVIDER || 'gemini').trim().toLowerCase();
+  // OpenAI par défaut : `gemini-2.5-flash`, l'ancien défaut, a été retiré de
+  // l'API Gemini le 16 octobre 2026, et le projet a un palier gratuit OpenAI.
+  const rawProvider = (env.AI_PROVIDER || 'openai').trim().toLowerCase();
   if (rawProvider !== 'gemini' && rawProvider !== 'openai') {
     throw new Error('AI_PROVIDER doit valoir "gemini" ou "openai".');
   }
@@ -254,7 +262,8 @@ async function generateWithOpenAi(
   config: AiProviderConfig,
   prompt: string,
   fetchImpl: typeof fetch,
-  reasoningEffort?: string,
+  reasoningEffort: string | undefined,
+  onUsage: (tokens: number) => void,
 ): Promise<any[]> {
   const response = await fetchImpl('https://api.openai.com/v1/responses', {
     method: 'POST',
@@ -267,6 +276,9 @@ async function generateWithOpenAi(
   });
 
   const payload: any = await response.json().catch(() => ({}));
+  // Décompté même quand la réponse est ensuite rejetée : le fournisseur la
+  // facture quand même.
+  onUsage(Number(payload?.usage?.total_tokens) || 0);
   if (!response.ok) {
     const detail = typeof payload?.error?.message === 'string'
       ? payload.error.message
@@ -281,9 +293,15 @@ async function generateWithOpenAi(
   return parsed.questions;
 }
 
+/**
+ * `onUsage` reçoit les tokens facturés par chaque appel, tels que le
+ * fournisseur les déclare : c'est ce qui borne la dépense du jour
+ * (`MAX_AI_TOKENS_PER_DAY`, server.ts).
+ */
 export function createQuestionGenerator(
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: typeof fetch = fetch,
+  onUsage: (tokens: number) => void = () => {},
 ): QuestionGenerator {
   const config = resolveAiProviderConfig(env);
   if (!config.apiKey) {
@@ -291,7 +309,7 @@ export function createQuestionGenerator(
   }
 
   if (config.provider === 'openai') {
-    const reasoningEffort = env.OPENAI_REASONING_EFFORT?.trim() || undefined;
+    const reasoningEffort = env.OPENAI_REASONING_EFFORT?.trim() || DEFAULT_OPENAI_REASONING_EFFORT;
     return {
       provider: config.provider,
       model: config.model,
@@ -300,6 +318,7 @@ export function createQuestionGenerator(
         buildQuestionGenerationPrompt(themeName, count, angle),
         fetchImpl,
         reasoningEffort,
+        onUsage,
       ),
     };
   }
@@ -322,6 +341,7 @@ export function createQuestionGenerator(
           abortSignal: AbortSignal.timeout(LLM_CALL_TIMEOUT_MS),
         },
       });
+      onUsage(Number(response.usageMetadata?.totalTokenCount) || 0);
 
       const parsed = JSON.parse(response.text || '[]');
       if (!Array.isArray(parsed)) {

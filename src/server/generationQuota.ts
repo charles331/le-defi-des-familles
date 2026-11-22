@@ -7,7 +7,8 @@
  * changeant d'adresse dans un bloc IPv6 — un abonné en reçoit des milliards —,
  * et sans plafond d'ensemble, la facture n'avait pas de borne. Trois étages
  * désormais, du plus fin au plus large : par salon (server.ts), par adresse
- * (regroupée par /64 en IPv6), et un budget global par jour.
+ * (regroupée par /64 en IPv6), et un budget global par jour — en générations,
+ * et en tokens réellement facturés par le fournisseur.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
@@ -94,11 +95,26 @@ export class SlidingWindowQuota {
 
 export const DEFAULT_MAX_GENERATIONS_PER_DAY = 200;
 
-/** `MAX_GENERATIONS_PER_DAY` : entier ≥ 0 (0 coupe la génération), sinon le défaut. */
-export function parseDailyLimit(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === '') return DEFAULT_MAX_GENERATIONS_PER_DAY;
-  const value = Number(raw);
-  return Number.isInteger(value) && value >= 0 ? value : DEFAULT_MAX_GENERATIONS_PER_DAY;
+/**
+ * Tokens que le fournisseur peut facturer par jour, toutes générations
+ * confondues. Le compte OpenAI du projet a un palier gratuit quotidien —
+ * 2,5 millions de tokens pour la famille « mini » (gpt-5.4-mini, le modèle par
+ * défaut), 250 000 pour gpt-5.4 — au-delà duquel chaque token est facturé.
+ * Compter les générations ne suffisait pas à rester dessous : une génération
+ * coûte de trois à douze appels selon le nombre de cartes et les relances. On
+ * s'arrête à 2 millions, pour garder la marge des lots déjà partis quand le
+ * plafond tombe. Avec un autre modèle, régler `MAX_AI_TOKENS_PER_DAY`.
+ */
+export const DEFAULT_MAX_AI_TOKENS_PER_DAY = 2_000_000;
+
+/** Entier ≥ 0 (0 coupe la génération), sinon la valeur par défaut donnée. */
+export function parseDailyLimit(
+  raw: string | undefined,
+  fallback = DEFAULT_MAX_GENERATIONS_PER_DAY,
+): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw.replace(/[\s_]/g, ''));
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
 interface StoredBudget {
@@ -112,14 +128,14 @@ function utcDay(now: number): string {
 }
 
 /**
- * Budget global de générations pour la journée.
+ * Budget global pour la journée : des générations, ou des tokens.
  *
  * Gardé sur disque quand un dossier de données est configuré : sans cela, un
  * redémarrage — qu'un attaquant ne provoque pas, mais qu'un redéploiement
  * provoque — remettrait le compteur à zéro. Si l'écriture échoue, le budget
  * continue en mémoire : mieux vaut un plafond qui oublie qu'un jeu en panne.
  */
-export class DailyGenerationBudget {
+export class DailyBudget {
   private state: StoredBudget;
   private persistenceBroken = false;
 
@@ -140,14 +156,34 @@ export class DailyGenerationBudget {
     }
   }
 
-  /** Réserve une génération ; `false` quand le budget du jour est épuisé. */
+  /** Le budget du jour est-il épuisé ? */
+  isExhausted(now = Date.now()): boolean {
+    this.rollOver(now);
+    return this.state.count >= this.limit;
+  }
+
+  /**
+   * Décompte ce qui a déjà été dépensé — les tokens d'une réponse reçue. Le
+   * compte peut dépasser la limite : un lot parti avant qu'elle tombe est
+   * facturé quand même, et ce qui suit doit le savoir.
+   */
+  add(amount: number, now = Date.now()): void {
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    this.rollOver(now);
+    this.state.count += Math.round(amount);
+    this.persist();
+  }
+
+  /** Réserve une unité (une génération) ; `false` quand le budget du jour est épuisé. */
   tryConsume(now = Date.now()): boolean {
+    if (this.isExhausted(now)) return false;
+    this.add(1, now);
+    return true;
+  }
+
+  private rollOver(now: number): void {
     const day = utcDay(now);
     if (day !== this.state.day) this.state = { day, count: 0 };
-    if (this.state.count >= this.limit) return false;
-    this.state.count += 1;
-    this.persist();
-    return true;
   }
 
   get used(): number {
@@ -169,7 +205,10 @@ export class DailyGenerationBudget {
   }
 }
 
-/** Fichier du budget, seulement si `DATA_DIR` est explicitement configuré. */
-export function dailyBudgetStorePath(dataDir = process.env.DATA_DIR): string | null {
-  return dataDir?.trim() ? path.join(dataDir.trim(), 'generation-budget.json') : null;
+/** Fichier d'un budget, seulement si `DATA_DIR` est explicitement configuré. */
+export function dailyBudgetStorePath(
+  dataDir = process.env.DATA_DIR,
+  fileName = 'generation-budget.json',
+): string | null {
+  return dataDir?.trim() ? path.join(dataDir.trim(), fileName) : null;
 }

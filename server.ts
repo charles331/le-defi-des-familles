@@ -18,7 +18,8 @@ import {
 import { previewOrigin, withAbsolutePreviewImages } from './src/server/previewMeta.js';
 import { MAX_THEME_NAME_LENGTH, createQuestionGenerator, sanitizeThemeName } from './src/server/questionGenerator.js';
 import {
-  DailyGenerationBudget,
+  DEFAULT_MAX_AI_TOKENS_PER_DAY,
+  DailyBudget,
   SlidingWindowQuota,
   dailyBudgetStorePath,
   ipQuotaKey,
@@ -109,9 +110,13 @@ const GENERATION_ATTEMPT_CAP = 90;
 const GENERATION_WINDOW_MS = 60 * 60 * 1000;
 const MAX_GENERATIONS_PER_IP = 6;
 const generationQuotaByIp = new SlidingWindowQuota(MAX_GENERATIONS_PER_IP, GENERATION_WINDOW_MS);
-const dailyGenerationBudget = new DailyGenerationBudget(
+const dailyGenerationBudget = new DailyBudget(
   parseDailyLimit(process.env.MAX_GENERATIONS_PER_DAY),
   dailyBudgetStorePath(),
+);
+const dailyTokenBudget = new DailyBudget(
+  parseDailyLimit(process.env.MAX_AI_TOKENS_PER_DAY, DEFAULT_MAX_AI_TOKENS_PER_DAY),
+  dailyBudgetStorePath(undefined, 'ai-token-budget.json'),
 );
 /**
  * Tentatives par salon. Le plafond suit celui des thèmes (MAX_CUSTOM_PACKS_PER_ROOM),
@@ -207,7 +212,7 @@ app.post('/api/generate-pack', async (req, res) => {
 
   let generator: ReturnType<typeof createQuestionGenerator>;
   try {
-    generator = createQuestionGenerator();
+    generator = createQuestionGenerator(process.env, fetch, tokens => dailyTokenBudget.add(tokens));
   } catch (err) {
     console.error('Configuration du générateur IA invalide:', err instanceof Error ? err.message : err);
     return res.status(503).json({ error: GENERATION_UNAVAILABLE });
@@ -228,6 +233,10 @@ app.post('/api/generate-pack', async (req, res) => {
   }
   // Dernier étage, le plus large : il borne la facture quel que soit le nombre
   // de salons et d'adresses en jeu.
+  if (dailyTokenBudget.isExhausted()) {
+    console.warn(`[Pack IA] Tokens du jour épuisés (${dailyTokenBudget.used} / ${dailyTokenBudget.limit}).`);
+    return res.status(503).json({ error: 'La création de thèmes a atteint sa limite du jour. Réessayez demain.' });
+  }
   if (!dailyGenerationBudget.tryConsume()) {
     console.warn(`[Pack IA] Budget du jour épuisé (${dailyGenerationBudget.limit} générations).`);
     return res.status(503).json({ error: 'La création de thèmes a atteint sa limite du jour. Réessayez demain.' });
@@ -296,7 +305,8 @@ app.post('/api/generate-pack', async (req, res) => {
 
     console.log(
       `[Pack IA/${generator.provider}:${generator.model}] "${cleanTheme}" : ${pack.questions.length} question(s) retenue(s)`
-        + ` sur ${pack.examined + malformed} générée(s) pour le salon ${roomCode} — rejets : ${describeRejections(pack.rejections)}`,
+        + ` sur ${pack.examined + malformed} générée(s) pour le salon ${roomCode} — rejets : ${describeRejections(pack.rejections)}`
+        + ` — tokens du jour : ${dailyTokenBudget.used} / ${dailyTokenBudget.limit}`,
     );
     // Ni les cartes ni leurs réponses : l'organisateur joue aussi, et l'interface
     // n'a besoin que du nom et du compte.

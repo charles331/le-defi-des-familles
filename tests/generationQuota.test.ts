@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_MAX_GENERATIONS_PER_DAY,
-  DailyGenerationBudget,
+  DEFAULT_MAX_AI_TOKENS_PER_DAY,
+  DailyBudget,
   SlidingWindowQuota,
   dailyBudgetStorePath,
   ipQuotaKey,
@@ -48,7 +49,7 @@ test('les entrées expirées sont purgées de la mémoire', () => {
 
 test('le budget global refuse au-delà du plafond, puis repart le lendemain', () => {
   const day = Date.UTC(2026, 10, 20, 12);
-  const budget = new DailyGenerationBudget(2, null, day);
+  const budget = new DailyBudget(2, null, day);
   assert.ok(budget.tryConsume(day));
   assert.ok(budget.tryConsume(day + 1));
   assert.equal(budget.tryConsume(day + 2), false);
@@ -57,7 +58,7 @@ test('le budget global refuse au-delà du plafond, puis repart le lendemain', ()
 });
 
 test('un plafond à zéro coupe la génération', () => {
-  const budget = new DailyGenerationBudget(0, null);
+  const budget = new DailyBudget(0, null);
   assert.equal(budget.tryConsume(), false);
 });
 
@@ -66,21 +67,45 @@ test('le budget survit à un redémarrage quand DATA_DIR est configuré', () => 
   try {
     const storePath = dailyBudgetStorePath(directory)!;
     const day = Date.UTC(2026, 10, 20, 8);
-    const before = new DailyGenerationBudget(3, storePath, day);
+    const before = new DailyBudget(3, storePath, day);
     before.tryConsume(day);
     before.tryConsume(day);
     assert.deepEqual(JSON.parse(readFileSync(storePath, 'utf8')), { day: '2026-11-20', count: 2 });
 
-    const after = new DailyGenerationBudget(3, storePath, day + 1000);
+    const after = new DailyBudget(3, storePath, day + 1000);
     assert.equal(after.used, 2);
     assert.ok(after.tryConsume(day + 1000));
     assert.equal(after.tryConsume(day + 1001), false);
 
-    const tomorrow = new DailyGenerationBudget(3, storePath, day + 24 * 60 * 60 * 1000);
+    const tomorrow = new DailyBudget(3, storePath, day + 24 * 60 * 60 * 1000);
     assert.equal(tomorrow.used, 0, 'le compteur d’hier ne compte plus');
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('le budget de tokens compte ce que le fournisseur facture, et s’arrête au plafond', () => {
+  const day = Date.UTC(2026, 10, 22, 9);
+  const tokens = new DailyBudget(10_000, null, day);
+  tokens.add(4600, day);
+  tokens.add(4600, day);
+  assert.equal(tokens.isExhausted(day), false);
+  // Un lot parti avant que le plafond tombe est facturé quand même : il compte.
+  tokens.add(4600, day);
+  assert.equal(tokens.used, 13_800);
+  assert.equal(tokens.isExhausted(day), true);
+  tokens.add(Number.NaN, day);
+  tokens.add(-50, day);
+  assert.equal(tokens.used, 13_800, 'un relevé absent ou absurde ne compte pas');
+  assert.equal(tokens.isExhausted(day + 24 * 60 * 60 * 1000), false);
+});
+
+test('les plafonds se lisent dans l’environnement, avec leur propre défaut', () => {
+  assert.equal(parseDailyLimit(undefined, DEFAULT_MAX_AI_TOKENS_PER_DAY), 2_000_000);
+  assert.equal(parseDailyLimit('200000', DEFAULT_MAX_AI_TOKENS_PER_DAY), 200_000);
+  assert.equal(parseDailyLimit('2_000_000', DEFAULT_MAX_AI_TOKENS_PER_DAY), 2_000_000);
+  assert.equal(parseDailyLimit('beaucoup', DEFAULT_MAX_AI_TOKENS_PER_DAY), 2_000_000);
+  assert.equal(parseDailyLimit(undefined), DEFAULT_MAX_GENERATIONS_PER_DAY);
 });
 
 test('sans DATA_DIR, le budget reste en mémoire', () => {
