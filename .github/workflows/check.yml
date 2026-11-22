@@ -1,6 +1,6 @@
 # Le contrat éditorial de la banque de questions et la suite de tests ne valent que
 # s'ils tournent sans qu'on y pense. `npm run check` enchaîne lint, tests, audit des
-# questions et build : cette CI le lance sur chaque poussée et chaque pull request,
+# questions et build : cette CI le lance sur chaque pull request et sur main,
 # pour qu'une carte fautive ou un détecteur affaibli ne puisse pas arriver sur main
 # sans que personne ne le voie.
 #
@@ -10,9 +10,12 @@
 # d'autres versions que celles de la production. Le code, lui, tourne sous Node.
 name: check
 
+# Sur main à chaque poussée, et sur chaque pull request — y compris celles de
+# Dependabot. Une seule exécution par PR : main étant protégée, c'est elle que la
+# règle « check doit passer » attend, sans ambiguïté avec un doublon ignoré.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 # Le jeton n'a besoin que de lire le dépôt : une étape compromise ne doit rien
@@ -22,9 +25,6 @@ permissions:
 
 jobs:
   check:
-    # Une pull request ouverte depuis une branche du dépôt est déjà vérifiée par
-    # sa poussée : seule celle d'un fork a besoin de son propre passage.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       # Actions épinglées par empreinte : une étiquette se déplace, un SHA non.
