@@ -8,9 +8,12 @@
  * les mêmes fonctions que l'audit de la banque rédigée.
  */
 
-import { CATEGORY_IDS } from '../data/categories';
+import { CATEGORY_IDS, normalizeCategoryId } from '../data/categories';
 import {
+  MAX_ADULT_OPTION_LENGTH,
+  MAX_ADULT_QUESTION_LENGTH,
   MAX_BARE_NUMBER_RATIO,
+  MAX_OPEN_ANSWER_LENGTH,
   MAX_SKELETON_REUSE,
   comparableAnswer,
   editorialRejectionReason,
@@ -19,9 +22,105 @@ import {
   paraphrasesSameFact,
   questionSkeleton,
 } from '../data/questionRules';
-import { DifficultyLevel, Question } from '../types';
+import { DifficultyLevel, Question, QuestionFormat } from '../types';
 
 const DIFFICULTY_ORDER: DifficultyLevel[] = ['enfant', 'ado', 'adulte'];
+
+/**
+ * Une anecdote « Le saviez-vous ? » tient en deux ou trois phrases. Au-delà,
+ * c'est le modèle qui déraille — ou qu'on a fait dérailler — et la carte part
+ * au rebut plutôt que d'afficher un roman à une table d'enfants.
+ */
+export const MAX_GENERATED_EXPLANATION_LENGTH = 500;
+
+const GENERATED_FORMATS: QuestionFormat[] = ['mcq', 'boolean', 'open'];
+
+/** Caractères de contrôle (sauf espaces ordinaires) : rien à faire sur une carte. */
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029]/;
+
+export function normalizeDifficulty(raw: unknown): DifficultyLevel {
+  const clean = String(raw ?? '').toLowerCase().trim();
+  if (clean.includes('enf') || clean.includes('facile') || clean.includes('easy')) return 'enfant';
+  if (clean.includes('ado') || clean.includes('moyen') || clean.includes('medium')) return 'ado';
+  return 'adulte';
+}
+
+function cleanText(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (text.length > maxLength || CONTROL_CHARACTERS.test(text)) return null;
+  return text;
+}
+
+/**
+ * Traduit une carte brute du modèle en `Question`, ou `null` si sa forme ne
+ * tient pas. Le schéma JSON demandé au fournisseur n'est qu'une prière : le
+ * modèle peut s'en écarter, et le thème qu'on lui passe vient d'un inconnu.
+ * Seuls les champs attendus, avec le bon type et dans leurs bornes, passent ;
+ * le contrôle éditorial (`assembleGeneratedPack`) vient ensuite.
+ */
+export function parseGeneratedCandidate(raw: unknown, id: string, themePack: string): Question | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const card = raw as Record<string, unknown>;
+
+  const question = cleanText(card.question, MAX_ADULT_QUESTION_LENGTH);
+  if (!question) return null;
+
+  const format = card.format === undefined || card.format === '' ? 'mcq' : card.format;
+  if (!GENERATED_FORMATS.includes(format as QuestionFormat)) return null;
+
+  if (!Array.isArray(card.options) || card.options.length > 4) return null;
+  const options: string[] = [];
+  for (const option of card.options) {
+    const text = cleanText(option, MAX_ADULT_OPTION_LENGTH);
+    if (text === null) return null;
+    options.push(text);
+  }
+
+  const correctAnswerIndex = card.correctAnswerIndex;
+  if (typeof correctAnswerIndex !== 'number' || !Number.isInteger(correctAnswerIndex)) return null;
+  const maxIndex = format === 'open' ? 0 : options.length - 1;
+  if (correctAnswerIndex < 0 || correctAnswerIndex > maxIndex) return null;
+
+  const explanation = cleanText(card.explanation, MAX_GENERATED_EXPLANATION_LENGTH);
+  if (!explanation) return null;
+
+  if (typeof card.categoryId !== 'string' || typeof card.difficulty !== 'string') return null;
+
+  const parsed: Question = {
+    id,
+    categoryId: normalizeCategoryId(card.categoryId),
+    question,
+    options,
+    correctAnswerIndex,
+    explanation,
+    difficulty: normalizeDifficulty(card.difficulty),
+    themePack,
+  };
+  if (format !== 'mcq') parsed.format = format as QuestionFormat;
+  if (format === 'open') {
+    const answer = cleanText(card.answer, MAX_OPEN_ANSWER_LENGTH);
+    if (!answer) return null;
+    parsed.answer = answer;
+  }
+  return parsed;
+}
+
+/** Applique `parseGeneratedCandidate` à un lot, en comptant les cartes mal formées. */
+export function parseGeneratedCandidates(
+  rawCards: unknown[],
+  themePack: string,
+  stamp = Date.now(),
+): { candidates: Question[]; malformed: number } {
+  const candidates: Question[] = [];
+  let malformed = 0;
+  rawCards.forEach((raw, index) => {
+    const parsed = parseGeneratedCandidate(raw, `gen_${stamp}_${index}`, themePack);
+    if (parsed) candidates.push(parsed);
+    else malformed += 1;
+  });
+  return { candidates, malformed };
+}
 
 /**
  * Indices qui rendent une carte explicitement cinématographique, même lorsque

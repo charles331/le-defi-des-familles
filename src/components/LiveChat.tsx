@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { EmojiReaction } from '../types';
 import { soundManager } from '../utils/sound';
+import { REACTION_EMOJIS } from '../config/reactions';
 
 interface LiveChatProps {
   onSendEmoji: (emoji: string) => void;
@@ -16,8 +17,6 @@ export const LiveChat: React.FC<LiveChatProps> = ({ onSendEmoji, emojiEvent }) =
   const [isOpen, setIsOpen] = useState(false);
   const activeTimersRef = useRef<Set<NodeJS.Timeout>>(new Set());
   const paletteRef = useRef<HTMLDivElement | null>(null);
-
-  const EMOJI_LIST = ['👏', '🎉', '🎯', '🤔', '😂', '🔥', '🏆', '😱'];
 
   useEffect(() => {
     if (document.visibilityState === 'visible' && emojiEvent && emojiEvent.id) {
@@ -104,7 +103,7 @@ export const LiveChat: React.FC<LiveChatProps> = ({ onSendEmoji, emojiEvent }) =
         ref={paletteRef}
         className="fixed bottom-3 right-3 z-30 flex items-center justify-end gap-1.5 rounded-full border border-slate-700 bg-slate-900/95 p-1.5 shadow-lg backdrop-blur-sm"
       >
-        {isOpen && EMOJI_LIST.map((emoji) => (
+        {isOpen && REACTION_EMOJIS.map((emoji) => (
           <button
             key={emoji}
             type="button"

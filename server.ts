@@ -1,94 +1,67 @@
 import express from 'express';
 import path from 'path';
-import { randomBytes, timingSafeEqual } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { createServer } from 'http';
-import { Server, Socket } from 'socket.io';
-import { createServer as createViteServer } from 'vite';
 import { QUESTIONS_DATABASE } from './src/data/questions.js';
-import { BOARD_CATEGORY_COUNT, buildBoard, resolveBoardCategories } from './src/data/boards.js';
-import { CATEGORIES, normalizeCategoryId } from './src/data/categories.js';
-import { QUESTION_TIMER_OPTIONS } from './src/utils/questionTimer.js';
+import { activeThemeKeys } from './src/server/questionSelection.js';
 import {
   normalize as normalizeText,
 } from './src/data/questionRules.js';
-import { checkStore, loadRooms, startRoomPersistence, saveRooms, ROOM_STORE_PATH } from './roomStore.js';
-import { advanceTurn, calculateMoves, removePlayerFromGame, resetGameForNewRound, resolveAnswer, togglePauseState } from './src/server/gameEngine.js';
-import {
-  beginFirstPlayerDraw,
-  pendingRollers,
-  purgeFirstPlayerRoll,
-  recordFirstPlayerRoll,
-  settleFirstPlayerDraw,
-  skipFirstPlayerDraw,
-  transferFirstPlayerRoll,
-} from './src/server/firstPlayerDraw.js';
-import { rollDie } from './src/server/diceThrow.js';
-import { createGameStateView } from './src/server/gameStateView.js';
-import { describeRecoveredSeat, findAbandonedSeat, mergeSeatInto } from './src/server/seats.js';
-import { isCardReadAloud, resolveOnAirIds, resolveReaderId } from './src/server/turnRoles.js';
+import { checkStore, loadRooms, startRoomPersistence, saveRooms, saveRoomsSync, ROOM_STORE_PATH } from './roomStore.js';
 import {
   KnownFactIndex,
   answerKeyOf,
   assembleGeneratedPack,
   describeRejections,
+  parseGeneratedCandidates,
 } from './src/server/packAssembly.js';
-import { activeThemeKeys, pickQuestionForPlayer } from './src/server/questionSelection.js';
 import { previewOrigin, withAbsolutePreviewImages } from './src/server/previewMeta.js';
-import { createQuestionGenerator } from './src/server/questionGenerator.js';
+import { MAX_THEME_NAME_LENGTH, createQuestionGenerator, sanitizeThemeName } from './src/server/questionGenerator.js';
+import {
+  DEFAULT_MAX_AI_TOKENS_PER_DAY,
+  DailyBudget,
+  SlidingWindowQuota,
+  dailyBudgetStorePath,
+  ipQuotaKey,
+  parseDailyLimit,
+} from './src/server/generationQuota.js';
+import { finalErrorHandler, securityHeaders } from './src/server/httpSecurity.js';
+import { negotiateEncoding } from './src/server/assetEncoding.js';
 import { DEFAULT_GENERATED_PACK_COUNT } from './src/config/generatedPack.js';
 import {
-  BIG_LEAP_BONUS,
-  BONUS_ROSTER,
-  awardSurpriseBonus,
-  useBonus,
-  useLeapBonus,
-  wheelSlotFor,
-} from './src/server/bonuses.js';
+  MAX_CUSTOM_PACKS_PER_ROOM,
+  MAX_CUSTOM_QUESTIONS_PER_ROOM,
+  Room,
+  attachGameSocketServer,
+  shuffled,
+} from './src/server/gameSocketServer.js';
+import { parsePublicOrigins, safeTokenEquals } from './src/server/socketGuards.js';
 import {
-  DEFAULT_BONUS_MODE,
-  DEFAULT_QUESTION_TIMER_SECONDS,
-  DEFAULT_READER_MODE,
-} from './src/config/gameSettings.js';
-import {
-  BonusType,
-  GameState,
-  Player,
-  GameSettings,
   Question,
-  CategoryId,
-  DifficultyLevel
 } from './src/types.js';
+
+/**
+ * Le mode développement ne s'active que sur demande explicite (`npm run dev`
+ * pose NODE_ENV=development). L'inverse prévalait : sans la variable — oubliée
+ * sur Railway —, le serveur de production montait le middleware Vite, qui sert
+ * le code source, et Express renvoyait ses piles d'appel aux clients. Le défaut
+ * est posé avant `express()`, qui lit NODE_ENV à sa création.
+ */
+if (!process.env.NODE_ENV) process.env.NODE_ENV = 'production';
+const isDevelopment = process.env.NODE_ENV === 'development';
 
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
-});
-
 const PORT = Number(process.env.PORT) || 3000;
-/**
- * Sans geste — appui simple, ou bouton de repli —, le dé part quand même vers le
- * plateau : en haut à gauche depuis son coin, la direction qu'aurait prise une
- * main qui le pousse en jeu.
- */
-const DEFAULT_THROW_ANGLE = 225;
-const PLAYER_COLORS = ['#EF4444', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4', '#F97316'];
 
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '256kb' }));
+app.disable('x-powered-by');
+app.use(securityHeaders({ production: !isDevelopment }));
+// La seule route JSON reçoit un nom de thème et un nombre : 8 ko suffisent
+// largement, et bornent ce qu'un inconnu fait analyser au serveur.
+app.use(express.json({ limit: '8kb' }));
 
 // --- AI DYNAMIC PACK GENERATOR ---
-
-function normalizeDifficulty(raw: unknown): DifficultyLevel {
-  const clean = String(raw ?? '').toLowerCase().trim();
-  if (clean.includes('enf') || clean.includes('facile') || clean.includes('easy')) return 'enfant';
-  if (clean.includes('ado') || clean.includes('moyen') || clean.includes('medium')) return 'ado';
-  return 'adulte';
-}
 
 /**
  * Ce que la banque rédigée sait déjà, indexé une seule fois : un pack généré ne
@@ -136,27 +109,85 @@ const GENERATION_OVERSHOOT = 1.5;
 const GENERATION_ATTEMPT_CAP = 90;
 const GENERATION_WINDOW_MS = 60 * 60 * 1000;
 const MAX_GENERATIONS_PER_IP = 6;
-const generationAttempts = new Map<string, number[]>();
+const generationQuotaByIp = new SlidingWindowQuota(MAX_GENERATIONS_PER_IP, GENERATION_WINDOW_MS);
+const dailyGenerationBudget = new DailyBudget(
+  parseDailyLimit(process.env.MAX_GENERATIONS_PER_DAY),
+  dailyBudgetStorePath(),
+);
+const dailyTokenBudget = new DailyBudget(
+  parseDailyLimit(process.env.MAX_AI_TOKENS_PER_DAY, DEFAULT_MAX_AI_TOKENS_PER_DAY),
+  dailyBudgetStorePath(undefined, 'ai-token-budget.json'),
+);
+/**
+ * Tentatives par salon. Le plafond suit celui des thèmes (MAX_CUSTOM_PACKS_PER_ROOM),
+ * doublé pour qu'une génération ratée — thème trop vague, fournisseur saturé —
+ * ne coûte pas un thème à la famille. Une `WeakMap` : le compteur disparaît
+ * avec le salon.
+ */
+const generationAttemptsByRoom = new WeakMap<object, number>();
 const generationsInProgress = new Set<string>();
+// Jamais le message d'un fournisseur ni le nom d'une variable de clé : le
+// détail part dans les journaux, le client ne reçoit que ceci.
+const GENERATION_UNAVAILABLE = 'La création de thèmes est indisponible pour le moment.';
+const GENERATION_FAILED = 'La génération a échoué, réessayez.';
 
-function safeTokenEquals(actual: string | undefined, expected: string): boolean {
-  if (!actual) return false;
-  const actualBuffer = Buffer.from(actual);
-  const expectedBuffer = Buffer.from(expected);
-  return actualBuffer.length === expectedBuffer.length
-    && timingSafeEqual(actualBuffer, expectedBuffer);
+function maxGenerationAttemptsPerRoom(): number {
+  return 2 * MAX_CUSTOM_PACKS_PER_ROOM;
 }
 
-function consumeGenerationQuota(key: string, now = Date.now()): boolean {
-  const activeAttempts = (generationAttempts.get(key) ?? [])
-    .filter(timestamp => now - timestamp < GENERATION_WINDOW_MS);
-  if (activeAttempts.length >= MAX_GENERATIONS_PER_IP) {
-    generationAttempts.set(key, activeAttempts);
-    return false;
+function samePackName(left: string, right: string): boolean {
+  return left.toLowerCase().trim() === right.toLowerCase().trim();
+}
+
+/**
+ * Le salon peut-il encore recevoir ce pack ? Vérifié avant d'appeler le
+ * fournisseur — inutile de payer une génération qui serait refusée —, puis de
+ * nouveau à l'ajout.
+ */
+function customPackRefusal(room: Room, themeName: string, questionCount: number): string | null {
+  const packs = room.gameState.customPacks ?? [];
+  const currentCount = packs.reduce((total, pack) => total + pack.questions.length, 0);
+  if (currentCount + questionCount > MAX_CUSTOM_QUESTIONS_PER_ROOM) {
+    return 'Ce salon a atteint sa limite de questions personnalisées.';
   }
-  activeAttempts.push(now);
-  generationAttempts.set(key, activeAttempts);
-  return true;
+  const existing = packs.some(pack => samePackName(pack.name, themeName));
+  if (!existing && packs.length >= MAX_CUSTOM_PACKS_PER_ROOM) {
+    return 'Ce salon a atteint sa limite de thèmes personnalisés.';
+  }
+  return null;
+}
+
+/**
+ * Range un pack généré dans le salon. C'était le rôle de l'événement socket
+ * `add-custom-pack`, qui recevait les questions **du client** : n'importe quel
+ * organisateur pouvait y glisser des cartes arbitraires, montrées ensuite à des
+ * enfants. Le pack ne quitte plus le serveur entre sa validation et son ajout.
+ */
+function addGeneratedPackToRoom(room: Room, themeName: string, questions: Question[]): string | null {
+  const refusal = customPackRefusal(room, themeName, questions.length);
+  if (refusal) return refusal;
+  if (!room.gameState.customPacks) room.gameState.customPacks = [];
+
+  const existing = room.gameState.customPacks.find(pack => samePackName(pack.name, themeName));
+  if (existing) existing.questions.push(...questions);
+  else room.gameState.customPacks.push({ name: themeName, questions });
+
+  // Le thème fraîchement généré rejoint les thèmes actifs, sans désactiver
+  // les autres : la table peut jouer avec ses trois thèmes à la fois.
+  if (!activeThemeKeys(room.settings).has(themeName.toLowerCase().trim())) {
+    const activeNames = [
+      ...(room.settings.customThemePackNames ?? []),
+      ...(room.settings.customThemePackName ? [room.settings.customThemePackName] : []),
+      themeName,
+    ];
+    room.settings.customThemePackNames = activeNames;
+    room.settings.customThemePackName = undefined;
+    room.gameState.settings.customThemePackNames = activeNames;
+    room.gameState.settings.customThemePackName = undefined;
+  }
+
+  room.gameState.questionsPool = [...questions, ...room.gameState.questionsPool];
+  return null;
 }
 
 app.post('/api/generate-pack', async (req, res) => {
@@ -167,35 +198,53 @@ app.post('/api/generate-pack', async (req, res) => {
     return res.status(403).json({ error: 'Génération réservée à l’organisateur du salon.' });
   }
 
+  // La requête est validée avant de toucher aux quotas : une faute de frappe
+  // ne doit pas consommer une génération.
+  const { themeName, count = DEFAULT_GENERATED_PACK_COUNT } = req.body ?? {};
+  const cleanTheme = typeof themeName === 'string' ? sanitizeThemeName(themeName) : '';
+  if (cleanTheme.length < 2 || themeName.length > MAX_THEME_NAME_LENGTH) {
+    return res.status(400).json({ error: `Nom de thème requis (2 à ${MAX_THEME_NAME_LENGTH} caractères).` });
+  }
+  const requestedCount = Math.min(
+    Math.max(Number(count) || DEFAULT_GENERATED_PACK_COUNT, 5),
+    GENERATION_MAX_COUNT,
+  );
+
   let generator: ReturnType<typeof createQuestionGenerator>;
   try {
-    generator = createQuestionGenerator();
+    generator = createQuestionGenerator(process.env, fetch, tokens => dailyTokenBudget.add(tokens));
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : 'Configuration IA invalide.';
-    console.error('Configuration du générateur IA invalide:', errorMessage);
-    return res.status(503).json({ error: errorMessage });
+    console.error('Configuration du générateur IA invalide:', err instanceof Error ? err.message : err);
+    return res.status(503).json({ error: GENERATION_UNAVAILABLE });
   }
 
-  const sourceKey = req.ip || req.socket.remoteAddress || 'unknown';
-  if (!consumeGenerationQuota(sourceKey)) {
-    return res.status(429).json({ error: 'Trop de générations récentes. Réessayez dans une heure.' });
-  }
   if (generationsInProgress.has(roomCode)) {
     return res.status(409).json({ error: 'Une génération est déjà en cours pour ce salon.' });
   }
+  const refusal = customPackRefusal(room, cleanTheme, requestedCount);
+  if (refusal) return res.status(409).json({ error: refusal });
 
+  const roomAttempts = generationAttemptsByRoom.get(room) ?? 0;
+  if (roomAttempts >= maxGenerationAttemptsPerRoom()) {
+    return res.status(429).json({ error: 'Ce salon a atteint sa limite de générations.' });
+  }
+  if (!generationQuotaByIp.consume(ipQuotaKey(req.ip || req.socket.remoteAddress))) {
+    return res.status(429).json({ error: 'Trop de générations récentes. Réessayez dans une heure.' });
+  }
+  // Dernier étage, le plus large : il borne la facture quel que soit le nombre
+  // de salons et d'adresses en jeu.
+  if (dailyTokenBudget.isExhausted()) {
+    console.warn(`[Pack IA] Tokens du jour épuisés (${dailyTokenBudget.used} / ${dailyTokenBudget.limit}).`);
+    return res.status(503).json({ error: 'La création de thèmes a atteint sa limite du jour. Réessayez demain.' });
+  }
+  if (!dailyGenerationBudget.tryConsume()) {
+    console.warn(`[Pack IA] Budget du jour épuisé (${dailyGenerationBudget.limit} générations).`);
+    return res.status(503).json({ error: 'La création de thèmes a atteint sa limite du jour. Réessayez demain.' });
+  }
+
+  generationAttemptsByRoom.set(room, roomAttempts + 1);
   generationsInProgress.add(roomCode);
   try {
-    const { themeName, count = DEFAULT_GENERATED_PACK_COUNT } = req.body;
-    if (!themeName || typeof themeName !== 'string' || themeName.trim().length < 2 || themeName.length > 100) {
-      return res.status(400).json({ error: 'Nom de thème requis (2 à 100 caractères).' });
-    }
-
-    const cleanTheme = themeName.trim();
-    const requestedCount = Math.min(
-      Math.max(Number(count) || DEFAULT_GENERATED_PACK_COUNT, 5),
-      GENERATION_MAX_COUNT,
-    );
     const attemptCount = Math.min(
       Math.ceil(requestedCount * GENERATION_OVERSHOOT),
       GENERATION_ATTEMPT_CAP,
@@ -224,1327 +273,105 @@ app.post('/api/generate-pack', async (req, res) => {
     );
 
     const rawQuestions = batchResults
-      .filter((r): r is PromiseFulfilledResult<any[]> => r.status === 'fulfilled')
+      .filter((r): r is PromiseFulfilledResult<unknown[]> => r.status === 'fulfilled')
       .flatMap(r => r.value);
 
     if (rawQuestions.length === 0) {
       const firstError = batchResults.find(r => r.status === 'rejected') as PromiseRejectedResult | undefined;
-      throw new Error(firstError?.reason instanceof Error ? firstError.reason.message : 'La génération a échoué, réessayez.');
+      console.error(`[Pack IA/${generator.provider}] Tous les lots ont échoué:`, firstError?.reason);
+      return res.status(502).json({ error: GENERATION_FAILED });
     }
 
-    // Mise en forme, puis contrôle éditorial complet : ce sont les règles de
-    // l'ADR 0001, celles que `npm run audit:questions` applique à la banque
-    // rédigée. Une carte non conforme est écartée, jamais rafistolée.
-    const stamp = Date.now();
-    const candidates: Question[] = rawQuestions
-      .filter((q) => q && typeof q.question === 'string' && Array.isArray(q.options))
-      .map((q, idx) => ({
-        id: `gen_${stamp}_${idx}`,
-        categoryId: normalizeCategoryId(q.categoryId),
-        question: q.question.trim(),
-        options: q.options.map((o: unknown) => String(o ?? '').trim()),
-        correctAnswerIndex: q.correctAnswerIndex,
-        explanation: typeof q.explanation === 'string' ? q.explanation.trim() : undefined,
-        difficulty: normalizeDifficulty(q.difficulty),
-        themePack: cleanTheme
-      }));
-
+    // Forme stricte d'abord (types, longueurs, bornes de l'index), puis contrôle
+    // éditorial complet : ce sont les règles de l'ADR 0001, celles que
+    // `npm run audit:questions` applique à la banque rédigée. Une carte non
+    // conforme est écartée, jamais rafistolée.
+    const { candidates, malformed } = parseGeneratedCandidates(rawQuestions, cleanTheme);
     const pack = assembleGeneratedPack(candidates, requestedCount, getKnownFacts());
+    if (malformed > 0) pack.rejections.set('carte mal formée', malformed);
 
     if (pack.questions.length === 0) {
-      throw new Error('Aucune question conforme générée, réessayez avec un thème plus précis.');
+      console.warn(`[Pack IA] "${cleanTheme}" : aucune carte conforme — ${describeRejections(pack.rejections)}`);
+      return res.status(422).json({ error: 'Aucune question conforme générée, réessayez avec un thème plus précis.' });
     }
+
+    // Le salon a pu fermer pendant la minute de génération.
+    if (rooms.get(roomCode) !== room) {
+      return res.status(410).json({ error: 'Le salon a été fermé pendant la génération.' });
+    }
+    const addRefusal = addGeneratedPackToRoom(room, cleanTheme, pack.questions);
+    if (addRefusal) return res.status(409).json({ error: addRefusal });
+    emitGameState(room);
 
     console.log(
       `[Pack IA/${generator.provider}:${generator.model}] "${cleanTheme}" : ${pack.questions.length} question(s) retenue(s)`
-        + ` sur ${pack.examined} générée(s) — rejets : ${describeRejections(pack.rejections)}`,
+        + ` sur ${pack.examined + malformed} générée(s) pour le salon ${roomCode} — rejets : ${describeRejections(pack.rejections)}`
+        + ` — tokens du jour : ${dailyTokenBudget.used} / ${dailyTokenBudget.limit}`,
     );
+    // Ni les cartes ni leurs réponses : l'organisateur joue aussi, et l'interface
+    // n'a besoin que du nom et du compte.
     return res.json({
       success: true,
-      questions: pack.questions,
       themeName: cleanTheme,
+      count: pack.questions.length,
       requested: requestedCount,
-      examined: pack.examined,
+      examined: pack.examined + malformed,
     });
   } catch (err: unknown) {
     console.error('Erreur génération IA:', err);
-    const errorMessage = err instanceof Error ? err.message : 'Erreur lors de la génération du thème';
-    return res.status(500).json({ error: errorMessage });
+    return res.status(500).json({ error: GENERATION_FAILED });
   } finally {
     generationsInProgress.delete(roomCode);
   }
 });
 
 // --- MULTIPLAYER ROOMS STORE ---
-interface Room {
-  code: string;
-  hostSocketId: string;
-  generationToken: string;
-  reconnectTokens: Map<string, string>;
-  settings: GameSettings;
-  gameState: GameState;
-  sockets: Map<string, Player>; // socketId -> Player
-  createdAt: number;
-  lastActivityAt: number;
-  emptySince: number | null;
-  hostDisconnectedAt: number | null;
-}
-
-/** Mélange de Fisher-Yates, partagé par le démarrage de partie et la reprise. */
-function shuffled<T>(values: T[]): T[] {
-  const result = [...values];
-  for (let i = result.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [result[i], result[j]] = [result[j], result[i]];
-  }
-  return result;
-}
-
 // Les parties survivent au redémarrage : sans cela, un redéploiement, un
 // plantage ou un simple rechargement de tsx en développement effaçait toutes
-// les salles en cours.
+// les salles en cours. Les salons eux-mêmes, et tout le jeu en temps réel,
+// vivent dans `src/server/gameSocketServer.ts`.
 const rooms: Map<string, Room> = loadRooms(QUESTIONS_DATABASE, shuffled);
-const positiveDuration = (value: string | undefined, fallback: number): number => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-};
-const MAX_ROOMS = 250;
-const MAX_PLAYERS_PER_ROOM = 12;
-const MAX_CUSTOM_PACKS_PER_ROOM = 3;
-const MAX_CUSTOM_QUESTIONS_PER_ROOM = 180;
-// Dix minutes : après un redéploiement ou une coupure de réseau, il faut laisser
-// à toute la famille le temps de revenir avant de fermer le salon.
-const HOST_RECONNECT_GRACE_MS = positiveDuration(process.env.ROOM_HOST_GRACE_MS, 10 * 60 * 1000);
-const EMPTY_ROOM_GRACE_MS = positiveDuration(process.env.ROOM_EMPTY_GRACE_MS, 10 * 60 * 1000);
-// Partie en pause : le salon est conservé quatre heures, le temps d'un repas ou
-// d'une soirée, même si tout le monde a fermé son navigateur.
-const PAUSED_ROOM_TTL_MS = positiveDuration(process.env.ROOM_PAUSED_TTL_MS, 4 * 60 * 60 * 1000);
-const ROOM_IDLE_TTL_MS = positiveDuration(process.env.ROOM_IDLE_TTL_MS, 4 * 60 * 60 * 1000);
-const ROOM_MAX_AGE_MS = positiveDuration(process.env.ROOM_MAX_AGE_MS, 12 * 60 * 60 * 1000);
-const ROOM_SWEEP_INTERVAL_MS = positiveDuration(process.env.ROOM_SWEEP_INTERVAL_MS, 30 * 1000);
-
-/**
- * Ne retient d'un envoi de réglages que ce qui est jouable.
- *
- * `update-settings` fusionnait le message du client tel quel dans les réglages du
- * salon. C'était l'entrée la plus permissive du serveur, et rien n'y était borné :
- * un nombre de camemberts au-delà des catégories du plateau rendait la partie
- * ingagnable, une durée de chrono négative cassait le décompte, et une catégorie
- * inconnue traversait jusqu'au plateau où le rendu la refusait. Aucune de ces
- * valeurs n'est atteignable depuis l'interface — c'est bien pour cela qu'un client
- * obsolète ou un salon repris du disque pouvait les produire sans qu'on le voie.
- *
- * Une clé absente reste absente : on ne réécrit jamais un réglage que l'hôte n'a
- * pas touché.
- */
-function sanitizeSettings(patch: Partial<GameSettings>): Partial<GameSettings> {
-  const clean: Partial<GameSettings> = {};
-  const bool = (value: unknown): boolean | undefined =>
-    typeof value === 'boolean' ? value : undefined;
-
-  if (patch.boardType !== undefined && ['wheel', 'snake', 'star'].includes(patch.boardType)) {
-    clean.boardType = patch.boardType;
-  }
-  if (Array.isArray(patch.selectedCategories)) {
-    // Les identifiants inconnus tombent, les doublons aussi, et l'on ne garde
-    // jamais plus que les six places du plateau.
-    const vues: CategoryId[] = [];
-    for (const categoryId of patch.selectedCategories) {
-      if (!(categoryId in CATEGORIES) || vues.includes(categoryId)) continue;
-      if (vues.length >= BOARD_CATEGORY_COUNT) break;
-      vues.push(categoryId);
-    }
-    clean.selectedCategories = vues;
-  }
-  if (typeof patch.timerSeconds === 'number'
-    && (QUESTION_TIMER_OPTIONS as readonly number[]).includes(patch.timerSeconds)) {
-    clean.timerSeconds = patch.timerSeconds;
-  }
-  if (typeof patch.wedgesToWin === 'number'
-    && Number.isInteger(patch.wedgesToWin)
-    && patch.wedgesToWin >= 1
-    && patch.wedgesToWin <= BOARD_CATEGORY_COUNT) {
-    clean.wedgesToWin = patch.wedgesToWin;
-  }
-  if (Array.isArray(patch.customThemePackNames)) {
-    clean.customThemePackNames = patch.customThemePackNames
-      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
-      .slice(0, 12);
-  }
-  for (const key of ['isLocalMode', 'isReaderMode', 'enableLiveCamera', 'enableBonuses'] as const) {
-    const value = bool(patch[key]);
-    if (value !== undefined) clean[key] = value;
-  }
-  return clean;
-}
-
-function getRoom(code: string): Room | undefined {
-  const room = rooms.get(code);
-  if (room) room.lastActivityAt = Date.now();
-  return room;
-}
-
-function emitGameState(room: Room): void {
-  for (const socketId of room.sockets.keys()) {
-    io.to(socketId).emit(
-      'game-state-update',
-      createGameStateView(room.gameState, socketId, room.hostSocketId),
-    );
-  }
-}
-
-function gameStateFor(room: Room, socketId: string) {
-  return createGameStateView(room.gameState, socketId, room.hostSocketId);
-}
-
-function closeRoom(code: string, reason: string): boolean {
-  const room = rooms.get(code);
-  if (!room) return false;
-
-  io.to(code).emit('room-closed', { reason });
-  io.in(code).socketsLeave(code);
-  room.sockets.clear();
-  room.reconnectTokens.clear();
-  room.gameState.players.length = 0;
-  room.gameState.questionsPool.length = 0;
-  room.gameState.usedQuestionIds.length = 0;
-  room.gameState.customPacks = [];
-  rooms.delete(code);
-  // Écriture immédiate : une salle fermée ne doit pas réapparaître si le
-  // serveur redémarre dans les secondes qui suivent.
-  saveRooms(rooms);
-  console.log(`[Room] Salon supprimé: ${code} (${reason}). Salons actifs: ${rooms.size}`);
-  return true;
-}
-
-/**
- * Rattache un siège existant à un nouvel appareil.
- *
- * Trois chemins mènent ici — la reconnexion par jeton, la reprise d'un siège
- * abandonné au prénom, la fusion d'un doublon par l'organisateur — et ils doivent
- * faire exactement la même chose : l'identifiant du joueur *est* son identifiant
- * de socket, donc tous les registres indexés dessus (sockets, jetons, siège de
- * l'organisateur, lancer d'ouverture) se déplacent en même temps. Un seul oubli
- * laisse un joueur présent à l'écran mais que le serveur n'autorise plus à agir.
- */
-function bindSeatToSocket(room: Room, seat: Player, previousSeatId: string, socket: Socket, sessionToken: string): void {
-  seat.id = socket.id;
-  seat.isConnected = true;
-  transferFirstPlayerRoll(room.gameState, previousSeatId, socket.id);
-
-  room.sockets.delete(previousSeatId);
-  room.sockets.set(socket.id, seat);
-  room.reconnectTokens.delete(previousSeatId);
-  room.reconnectTokens.set(socket.id, sessionToken);
-  room.emptySince = null;
-
-  if (room.hostSocketId === previousSeatId) {
-    room.hostSocketId = socket.id;
-    room.hostDisconnectedAt = null;
-    seat.isHost = true;
-  }
-
-  socket.join(room.code);
-}
-
-function removeSocketFromRoom(room: Room, socketId: string): void {
-  room.sockets.delete(socketId);
-  room.reconnectTokens.delete(socketId);
-  const playerIndex = room.gameState.players.findIndex(player => player.id === socketId);
-  if (playerIndex >= 0) {
-    room.gameState.players.splice(playerIndex, 1);
-    if (room.gameState.activePlayerIndex >= room.gameState.players.length) {
-      room.gameState.activePlayerIndex = 0;
-    } else if (playerIndex < room.gameState.activePlayerIndex) {
-      room.gameState.activePlayerIndex -= 1;
-    }
-    // Un départ pendant le tirage retire le lancer du partant, et peut suffire à
-    // départager ceux qui restent.
-    purgeFirstPlayerRoll(room.gameState, socketId);
-    settleFirstPlayerDraw(room.gameState);
-  }
-}
-
-function leaveAllRoomsForSocket(socketId: string, reason: string): void {
-  for (const [code, room] of rooms.entries()) {
-    if (!room.sockets.has(socketId)) continue;
-    if (room.hostSocketId === socketId) {
-      closeRoom(code, reason);
-    } else {
-      removeSocketFromRoom(room, socketId);
-      room.emptySince = room.sockets.size === 0 ? Date.now() : null;
-      emitGameState(room);
-    }
-  }
-}
-
-const roomSweep = setInterval(() => {
-  const now = Date.now();
-  for (const [code, room] of rooms.entries()) {
-    // Une partie en pause échappe aux délais courts : ni l'absence de
-    // l'organisateur ni un salon vide ne la ferment. Seule la fenêtre de pause
-    // la limite, afin qu'un salon oublié ne reste pas indéfiniment ouvert.
-    if (room.gameState.isPaused) {
-      const pausedSince = room.gameState.pausedAt ?? now;
-      if (now - pausedSince >= PAUSED_ROOM_TTL_MS) {
-        closeRoom(code, 'La partie est restée en pause trop longtemps.');
-      }
-      continue;
-    }
-
-    if (now - room.createdAt >= ROOM_MAX_AGE_MS) {
-      closeRoom(code, 'Durée maximale du salon atteinte.');
-    } else if (now - room.lastActivityAt >= ROOM_IDLE_TTL_MS) {
-      closeRoom(code, 'Le salon a expiré après une longue période d’inactivité.');
-    } else if (room.hostDisconnectedAt && now - room.hostDisconnectedAt >= HOST_RECONNECT_GRACE_MS) {
-      closeRoom(code, 'L’organisateur a quitté le salon.');
-    } else if (room.emptySince && now - room.emptySince >= EMPTY_ROOM_GRACE_MS) {
-      closeRoom(code, 'Le salon est vide.');
-    }
-  }
-}, ROOM_SWEEP_INTERVAL_MS);
-roomSweep.unref();
-
-function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  for (let attempt = 0; attempt < 20; attempt++) {
-    let code = '';
-    for (let i = 0; i < 4; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    const candidate = `FAM-${code}`;
-    if (!rooms.has(candidate)) return candidate;
-  }
-  throw new Error('Impossible de générer un code de salon unique.');
-}
-
-// Socket.IO Connection Handler
-io.on('connection', (socket: Socket) => {
-  console.log(`[Socket] Connexion: ${socket.id}`);
-
-  // Create Private Room
-  socket.on('create-room', (data: { player: Partial<Player>; settings: Partial<GameSettings> }) => {
-    leaveAllRoomsForSocket(socket.id, 'L’organisateur a créé un nouveau salon.');
-    if (rooms.size >= MAX_ROOMS) {
-      return socket.emit('error-msg', 'Trop de salons sont actifs. Réessayez dans quelques minutes.');
-    }
-
-    const roomCode = generateRoomCode();
-    const isLocal = data.settings?.isLocalMode || false;
-
-    const hostPlayer: Player = {
-      id: socket.id,
-      name: data.player.name || 'Hôte Famille',
-      avatarId: data.player.avatarId || 'lion',
-      color: data.player.color || '#EF4444',
-      difficulty: data.player.difficulty || 'adulte',
-      wedges: [],
-      currentTileId: 0,
-      isHost: true,
-      isReady: isLocal,
-      score: 0,
-      correctAnswersCount: 0,
-      totalAnswersCount: 0,
-      isConnected: true,
-      bonuses: {},
-    };
-
-    const initialSettings: GameSettings = {
-      roomCode,
-      boardType: data.settings.boardType || 'wheel',
-      selectedCategories: data.settings.selectedCategories || ['histoire', 'geographie', 'cinema', 'sciences', 'art', 'sports'],
-      timerSeconds: data.settings.timerSeconds ?? DEFAULT_QUESTION_TIMER_SECONDS,
-      wedgesToWin: data.settings.wedgesToWin || 6,
-      isLocalMode: isLocal,
-      isReaderMode: data.settings?.isReaderMode ?? DEFAULT_READER_MODE,
-      enableLiveCamera: data.settings?.enableLiveCamera ?? false,
-      enableBonuses: data.settings?.enableBonuses ?? DEFAULT_BONUS_MODE,
-    };
-
-    const initialGameState: GameState = {
-      roomCode,
-      phase: 'lobby',
-      settings: initialSettings,
-      players: [hostPlayer],
-      activePlayerIndex: 0,
-      diceValue: null,
-      diceThrow: null,
-      possibleMoves: [],
-      selectedTileId: null,
-      currentQuestion: null,
-      questionStartTime: null,
-      lastAnswerResult: null,
-      winnerId: null,
-      questionsPool: [...QUESTIONS_DATABASE],
-      usedQuestionIds: [],
-      bonusAwardedThisTurn: null,
-      activeQuestionBonus: null,
-    };
-
-    const now = Date.now();
-    const room: Room = {
-      code: roomCode,
-      hostSocketId: socket.id,
-      generationToken: randomBytes(32).toString('base64url'),
-      reconnectTokens: new Map([[socket.id, randomBytes(32).toString('base64url')]]),
-      settings: initialSettings,
-      gameState: initialGameState,
-      sockets: new Map([[socket.id, hostPlayer]]),
-      createdAt: now,
-      lastActivityAt: now,
-      emptySince: null,
-      hostDisconnectedAt: null
-    };
-
-    rooms.set(roomCode, room);
-    socket.join(roomCode);
-
-    socket.emit('room-created', {
-      roomCode,
-      player: hostPlayer,
-      gameState: gameStateFor(room, socket.id),
-      generationToken: room.generationToken,
-      sessionToken: room.reconnectTokens.get(socket.id),
-    });
-    console.log(`[Room] Salon créé: ${roomCode} par ${hostPlayer.name}`);
-  });
-
-  // Reconnect Existing Session (on page refresh or disconnect recovery)
-  socket.on('reconnect-session', (data: { roomCode: string; playerId: string; sessionToken?: string }) => {
-    const code = (data.roomCode || '').toUpperCase().trim();
-    const room = getRoom(code);
-
-    if (!room) {
-      return socket.emit('reconnect-failed', { message: 'Salon expiré ou introuvable.' });
-    }
-
-    const player = room.gameState.players.find(p => p.id === data.playerId);
-    const expectedSessionToken = room.reconnectTokens.get(data.playerId);
-    if (!player || !expectedSessionToken || !safeTokenEquals(data.sessionToken, expectedSessionToken)) {
-      return socket.emit('reconnect-failed', { message: 'Joueur non trouvé dans ce salon.' });
-    }
-
-    // Le lancer du tirage suit le joueur : il n'a pas à relancer après un
-    // simple rafraîchissement de page.
-    bindSeatToSocket(room, player, player.id, socket, expectedSessionToken);
-
-    socket.emit('room-joined', {
-      roomCode: code,
-      player,
-      gameState: gameStateFor(room, socket.id),
-      generationToken: player.isHost ? room.generationToken : undefined,
-      sessionToken: expectedSessionToken,
-    });
-    emitGameState(room);
-    console.log(`[Room] ${player.name} s'est reconnecté avec succès à ${code}`);
-  });
-
-  // Join Room
-  socket.on('join-room', (data: { roomCode: string; player: Partial<Player> }) => {
-    const code = (data.roomCode || '').toUpperCase().trim();
-    const room = getRoom(code);
-
-    if (!room) {
-      return socket.emit('error-msg', 'Salon introuvable. Vérifiez le code de la salle privée.');
-    }
-
-    // Quelqu'un qui revient avec son prénom reprend son siège au lieu d'en créer
-    // un second. C'est le filet du jeton de session, qui ne survit pas au
-    // changement de navigateur : sans lui, une coupure de réseau se soldait par un
-    // doublon — un « Christelle » déconnecté avec quatre camemberts, un autre à
-    // zéro — que rien ne permettait de réunir.
-    const abandonedSeat = findAbandonedSeat(room.gameState, data.player.name || '');
-    if (abandonedSeat) {
-      const recoveredToken = randomBytes(32).toString('base64url');
-      const previousSeatId = abandonedSeat.id;
-      bindSeatToSocket(room, abandonedSeat, previousSeatId, socket, recoveredToken);
-      // Elle peut avoir changé d'avis sur son avatar en revenant ; ses camemberts,
-      // son pion et son niveau, eux, appartiennent à la partie en cours.
-      if (data.player.avatarId) abandonedSeat.avatarId = data.player.avatarId;
-      settleFirstPlayerDraw(room.gameState);
-
-      socket.emit('room-joined', {
-        roomCode: code,
-        player: abandonedSeat,
-        gameState: gameStateFor(room, socket.id),
-        generationToken: abandonedSeat.isHost ? room.generationToken : undefined,
-        sessionToken: recoveredToken,
-      });
-      room.gameState.lastTurnEventMessage = describeRecoveredSeat(abandonedSeat.name, abandonedSeat.wedges.length);
-      emitGameState(room);
-      saveRooms(rooms);
-      console.log(`[Room] ${abandonedSeat.name} a retrouvé son siège dans ${code}`);
-      return;
-    }
-
-    if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
-      return socket.emit('error-msg', 'Ce salon a atteint sa limite de joueurs.');
-    }
-
-    // Create new player in room
-    const newPlayer: Player = {
-      id: socket.id,
-      name: data.player.name || `Joueur ${room.gameState.players.length + 1}`,
-      avatarId: data.player.avatarId || 'fox',
-      color: data.player.color || '#3B82F6',
-      difficulty: data.player.difficulty || 'adulte',
-      wedges: [],
-      currentTileId: 0,
-      isHost: false,
-      isReady: false,
-      score: 0,
-      correctAnswersCount: 0,
-      totalAnswersCount: 0,
-      isConnected: true,
-      bonuses: {},
-    };
-
-    room.sockets.set(socket.id, newPlayer);
-    const sessionToken = randomBytes(32).toString('base64url');
-    room.reconnectTokens.set(socket.id, sessionToken);
-    room.gameState.players.push(newPlayer);
-    room.emptySince = null;
-    socket.join(code);
-
-    socket.emit('room-joined', {
-      roomCode: code,
-      player: newPlayer,
-      gameState: gameStateFor(room, socket.id),
-      sessionToken,
-    });
-    emitGameState(room);
-    console.log(`[Room] ${newPlayer.name} a rejoint le salon ${code}`);
-  });
-
-  // Local Pass & Play Add Player
-  socket.on('add-local-player', (data: { roomCode: string; player: Partial<Player> }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode) return;
-    if (room.gameState.players.length >= MAX_PLAYERS_PER_ROOM) {
-      return socket.emit('error-msg', 'Ce salon a atteint sa limite de joueurs.');
-    }
-
-    const usedColors = new Set(room.gameState.players.map(player => player.color.toLowerCase()));
-    const requestedColor = data.player.color?.toLowerCase();
-    const availableColor = PLAYER_COLORS.find(color => !usedColors.has(color.toLowerCase())) || data.player.color || '#10B981';
-
-    const newPlayer: Player = {
-      id: `local_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      name: data.player.name || `Joueur ${room.gameState.players.length + 1}`,
-      avatarId: data.player.avatarId || 'robot',
-      color: requestedColor && !usedColors.has(requestedColor) ? data.player.color! : availableColor,
-      difficulty: data.player.difficulty || 'enfant',
-      wedges: [],
-      currentTileId: 0,
-      isHost: false,
-      isReady: true,
-      score: 0,
-      correctAnswersCount: 0,
-      totalAnswersCount: 0,
-      isConnected: true,
-      bonuses: {},
-    };
-
-    room.gameState.players.push(newPlayer);
-    emitGameState(room);
-  });
-
-  /**
-   * L'organisateur retire un joueur, y compris en pleine partie.
-   *
-   * Il n'existait aucun moyen de le faire : seul le départ volontaire
-   * (`leave-room`) sortait quelqu'un d'une partie lancée, et `remove-local-player`
-   * est bloqué hors du lobby. Une famille où un enfant va se coucher restait donc
-   * avec un pion inerte qui prenait son tour à chaque passage.
-   *
-   * L'organisateur ne peut pas se retirer lui-même par ce chemin : partir ferme le
-   * salon pour tout le monde, ce qui est une autre décision et passe par
-   * « Quitter ».
-   */
-  socket.on('remove-player', (data: { roomCode: string; playerId: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-    if (!data.playerId || data.playerId === room.hostSocketId) return;
-
-    const player = room.gameState.players.find(candidate => candidate.id === data.playerId);
-    if (!player) return;
-    const removedName = player.name;
-
-    if (!removePlayerFromGame(room.gameState, data.playerId)) return;
-
-    // Le siège d'un joueur en ligne libère aussi son socket et son jeton : sans
-    // cela il se reconnecterait dans un salon qui ne l'attend plus.
-    if (!data.playerId.startsWith('local_')) {
-      room.sockets.delete(data.playerId);
-      room.reconnectTokens.delete(data.playerId);
-      io.to(data.playerId).emit('room-left');
-      io.sockets.sockets.get(data.playerId)?.leave(room.code);
-    }
-
-    room.gameState.lastTurnEventMessage = `${removedName} a quitté la partie.`;
-    emitGameState(room);
-    saveRooms(rooms);
-    console.log(`[Room] ${removedName} retiré du salon ${room.code} par l'organisateur`);
-  });
-
-  /**
-   * L'organisateur réunit un doublon avec le siège qu'il aurait dû retrouver.
-   *
-   * La reprise automatique par prénom couvre le cas courant, mais pas celui où la
-   * personne est revenue sous un autre nom, ni les parties déjà abîmées. Il fallait
-   * une réparation manuelle : jusqu'ici, un doublon était définitif et les
-   * camemberts du siège d'origine étaient perdus pour la partie.
-   *
-   * C'est le siège d'origine qui l'emporte — il porte la partie déjà jouée — et
-   * l'appareil du doublon qui en reprend les commandes.
-   */
-  socket.on('merge-player', (data: { roomCode: string; sourcePlayerId: string; targetPlayerId: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-
-    const seat = room.gameState.players.find(player => player.id === data.targetPlayerId);
-    const duplicate = room.gameState.players.find(player => player.id === data.sourcePlayerId);
-    if (!seat || !duplicate) return;
-    if (duplicate.id.startsWith('local_') || seat.id.startsWith('local_')) return;
-
-    const duplicateName = duplicate.name;
-    const merged = mergeSeatInto(room.gameState, data.sourcePlayerId, data.targetPlayerId);
-    if (!merged) return;
-
-    // Le doublon a disparu de la table, mais son appareil reste en ligne : c'est
-    // désormais lui qui tient le siège d'origine, donc ses registres suivent.
-    const token = room.reconnectTokens.get(data.sourcePlayerId) ?? randomBytes(32).toString('base64url');
-    room.sockets.delete(merged.previousSeatId);
-    room.sockets.set(data.sourcePlayerId, merged.seat);
-    room.reconnectTokens.delete(merged.previousSeatId);
-    room.reconnectTokens.set(data.sourcePlayerId, token);
-    if (room.hostSocketId === merged.previousSeatId) {
-      room.hostSocketId = data.sourcePlayerId;
-      room.hostDisconnectedAt = null;
-      merged.seat.isHost = true;
-    }
-    settleFirstPlayerDraw(room.gameState);
-
-    // L'appareil fusionné doit apprendre son nouvel identifiant de joueur, sinon
-    // il continue de se croire le doublon et le serveur refuse ses actions.
-    io.to(data.sourcePlayerId).emit('room-joined', {
-      roomCode: room.code,
-      player: merged.seat,
-      gameState: createGameStateView(room.gameState, data.sourcePlayerId, room.hostSocketId),
-      generationToken: merged.seat.isHost ? room.generationToken : undefined,
-      sessionToken: token,
-    });
-
-    room.gameState.lastTurnEventMessage = describeRecoveredSeat(merged.seat.name, merged.seat.wedges.length);
-    emitGameState(room);
-    saveRooms(rooms);
-    console.log(`[Room] Fusion dans ${room.code} : ${duplicateName} rendu à son siège d'origine`);
-  });
-
-  socket.on('remove-local-player', (data: { roomCode: string; playerId: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id || !room.settings.isLocalMode || room.gameState.phase !== 'lobby') return;
-    if (!data.playerId?.startsWith('local_')) return;
-
-    room.gameState.players = room.gameState.players.filter(player => player.id !== data.playerId);
-    emitGameState(room);
-  });
-
-  socket.on('toggle-ready', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase !== 'lobby' || room.settings.isLocalMode) return;
-
-    const player = room.gameState.players.find(p => p.id === socket.id);
-    if (!player) return;
-
-    player.isReady = !player.isReady;
-    emitGameState(room);
-  });
-
-  // Update Settings (Host only)
-  socket.on('update-settings', (data: { roomCode: string; settings: Partial<GameSettings> }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-
-    // Les réglages ne se modifient que dans le salon. Sans ce garde, un client
-    // resté sur un vieil écran pouvait changer le nombre de camemberts ou la durée
-    // du chrono au milieu d'une partie déjà commencée.
-    if (room.gameState.phase !== 'lobby') return;
-
-    // Et ils se valident, au lieu d'être fusionnés tels quels. C'était l'entrée la
-    // plus permissive du serveur : un `wedgesToWin` de 99 rendait la partie
-    // ingagnable, un `timerSeconds` négatif cassait le décompte, et une catégorie
-    // inconnue faisait planter le rendu du plateau. Rien de tout cela n'est
-    // atteignable depuis l'interface — c'est précisément pourquoi personne ne s'en
-    // apercevrait.
-    room.settings = { ...room.settings, ...sanitizeSettings(data.settings) };
-    room.gameState.settings = room.settings;
-
-    emitGameState(room);
-  });
-
-  // Update Player Profile (Avatar, Color, Name, Difficulty)
-  socket.on('update-player', (data: { roomCode: string; player: Partial<Player> }) => {
-    const room = getRoom(data.roomCode);
-    if (!room) return;
-
-    const requestedPlayer = room.gameState.players.find(pl => pl.id === data.player.id);
-    const canEditRequestedLocalPlayer = room.hostSocketId === socket.id && requestedPlayer?.id.startsWith('local_');
-    const p = room.gameState.players.find(pl => pl.id === socket.id) || (canEditRequestedLocalPlayer ? requestedPlayer : undefined);
-    if (p) {
-      if (data.player.name !== undefined) p.name = data.player.name;
-      if (data.player.avatarId) p.avatarId = data.player.avatarId;
-      if (data.player.color) p.color = data.player.color;
-      if (data.player.difficulty) p.difficulty = data.player.difficulty;
-
-      emitGameState(room);
-    }
-  });
-
-  // Add Custom AI Theme Pack
-  socket.on('add-custom-pack', (data: { roomCode: string; themeName: string; questions: Question[] }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-    if (!Array.isArray(data.questions) || data.questions.length === 0 || data.questions.length > 60) {
-      return socket.emit('error-msg', 'Un pack doit contenir entre 1 et 60 questions.');
-    }
-
-    if (!room.gameState.customPacks) {
-      room.gameState.customPacks = [];
-    }
-
-    const existingIndex = room.gameState.customPacks.findIndex(
-      p => p.name.toLowerCase().trim() === data.themeName.toLowerCase().trim()
-    );
-
-    const currentCustomQuestionCount = room.gameState.customPacks.reduce(
-      (total, pack) => total + pack.questions.length,
-      0
-    );
-    if (currentCustomQuestionCount + data.questions.length > MAX_CUSTOM_QUESTIONS_PER_ROOM) {
-      return socket.emit('error-msg', 'Ce salon a atteint sa limite de questions personnalisées.');
-    }
-    if (existingIndex < 0 && room.gameState.customPacks.length >= MAX_CUSTOM_PACKS_PER_ROOM) {
-      return socket.emit('error-msg', 'Ce salon a atteint sa limite de thèmes personnalisés.');
-    }
-
-    if (existingIndex >= 0) {
-      room.gameState.customPacks[existingIndex].questions.push(...data.questions);
-    } else {
-      room.gameState.customPacks.push({
-        name: data.themeName,
-        questions: data.questions
-      });
-    }
-
-    // Le thème fraîchement généré rejoint les thèmes actifs, sans désactiver
-    // les autres : la table peut jouer avec ses trois thèmes à la fois.
-    if (!activeThemeKeys(room.settings).has(data.themeName.toLowerCase().trim())) {
-      const activeNames = [
-        ...(room.settings.customThemePackNames ?? []),
-        ...(room.settings.customThemePackName ? [room.settings.customThemePackName] : []),
-        data.themeName,
-      ];
-      room.settings.customThemePackNames = activeNames;
-      room.settings.customThemePackName = undefined;
-      room.gameState.settings.customThemePackNames = activeNames;
-      room.gameState.settings.customThemePackName = undefined;
-    }
-
-    // Merge into room's active questions pool
-    room.gameState.questionsPool = [...data.questions, ...room.gameState.questionsPool];
-
-    emitGameState(room);
-    console.log(`[Pack IA] ${data.questions.length} questions ajoutées pour "${data.themeName}" dans le salon ${data.roomCode}`);
-  });
-
-  /**
-   * Retour au salon depuis l'écran de victoire.
-   *
-   * Le bouton était câblé sur `leave-room`, si bien que l'organisateur qui venait
-   * de gagner fermait le salon pour toute la table : « l'organisateur a fermé le
-   * salon ». Ce n'est pas la même intention — on veut revenir régler la partie et
-   * en relancer une, pas s'en aller.
-   */
-  socket.on('return-to-lobby', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-    if (room.gameState.phase === 'lobby') return;
-
-    resetGameForNewRound(room.gameState);
-    room.gameState.phase = 'lobby';
-    emitGameState(room);
-    saveRooms(rooms);
-    console.log(`[Room] ${room.code} revient au salon`);
-  });
-
-  // Start Game
-  socket.on('start-game', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-
-    if (room.gameState.players.length < 1) {
-      return socket.emit('error-msg', 'Il faut au moins 1 joueur pour commencer.');
-    }
-
-    if (!room.settings.isLocalMode) {
-      const connectedPlayers = room.gameState.players.filter(player => player.isConnected);
-      if (connectedPlayers.some(player => !player.isReady)) {
-        return socket.emit('error-msg', 'Tous les joueurs connectés doivent être prêts avant de commencer.');
-      }
-    }
-
-    // Exactement six catégories, ni plus ni moins : la roue a six branches et le
-    // camembert six parts (ADR 0007). Le refus se fait ici et pas seulement dans
-    // l'interface, parce que c'est le serveur qui construit le plateau — et parce
-    // qu'un salon repris du disque peut porter une sélection d'une version d'avant.
-    if (room.settings.selectedCategories?.length !== BOARD_CATEGORY_COUNT) {
-      return socket.emit(
-        'error-msg',
-        `Choisissez exactement ${BOARD_CATEGORY_COUNT} catégories pour le plateau.`,
-      );
-    }
-
-    // Ensure all players have a non-empty name when game starts
-    room.gameState.players.forEach((player, idx) => {
-      if (!player.name || !player.name.trim()) {
-        player.name = `Joueur ${idx + 1}`;
-      }
-    });
-
-    // Une nouvelle manche repart de zéro : camemberts, pions, scores et bonus.
-    // Sans cela, « Rejouer » après une victoire redonnait la main au vainqueur
-    // avec tous ses camemberts déjà en poche.
-    resetGameForNewRound(room.gameState);
-
-    // Les catégories du plateau se figent ici, au lancement, et plus jamais après :
-    // l'hôte peut encore toucher aux réglages du salon, mais une partie en cours ne
-    // doit pas voir ses cases changer de catégorie sous elle. Après la remise à zéro,
-    // pour qu'un futur nettoyage de manche ne les efface pas.
-    room.gameState.boardCategories = resolveBoardCategories(room.settings.selectedCategories);
-
-    // Collect all custom questions from custom packs added to the room
-    const customQuestions: Question[] = [];
-    if (room.gameState.customPacks) {
-      room.gameState.customPacks.forEach((pack) => {
-        customQuestions.push(...pack.questions);
-      });
-    }
-
-    // Shuffle questions pool on game start (custom pack questions included first)
-    room.gameState.questionsPool = shuffled([...customQuestions, ...QUESTIONS_DATABASE]);
-
-    // Le premier joueur n'est plus l'organisateur d'office : tout le monde
-    // lance le dé une fois et le meilleur lancer ouvre la partie. Une partie
-    // solo n'a évidemment rien à départager.
-    if (room.gameState.players.length === 1) {
-      skipFirstPlayerDraw(room.gameState);
-    } else {
-      beginFirstPlayerDraw(room.gameState, Date.now());
-    }
-
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  /**
-   * Qui lance, et pour qui.
-   *
-   * En ligne, chacun lance pour lui-même. En pass & play, l'appareil est unique :
-   * l'organisateur lance pour chaque joueur à son tour, dans l'ordre de la table.
-   */
-  function resolveFirstPlayerRoller(room: Room, socketId: string, requestedId?: string): Player | null {
-    const pending = pendingRollers(room.gameState);
-    if (pending.length === 0) return null;
-
-    const roller = room.settings.isLocalMode
-      ? room.hostSocketId === socketId ? pending[0] : null
-      : pending.find(player => player.id === socketId) ?? null;
-
-    // Le client annonce pour qui il croit lancer. S'il se trompe — parce que la
-    // partie a avancé entre-temps, ou parce qu'il vise quelqu'un d'autre — mieux
-    // vaut refuser que d'attribuer le lancer au voisin.
-    if (!roller || (requestedId && requestedId !== roller.id)) return null;
-    return roller;
-  }
-
-  // Tirage du premier joueur : un seul lancer par joueur.
-  socket.on('roll-first-player', (data: { roomCode: string; playerId?: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase !== 'first_player_roll') return;
-    if (isPaused(room)) return;
-
-    const roller = resolveFirstPlayerRoller(room, socket.id, data.playerId);
-    if (!roller) return;
-
-    const dice = Math.floor(Math.random() * 6) + 1;
-    if (!recordFirstPlayerRoll(room.gameState, roller.id, dice, Date.now())) return;
-
-    settleFirstPlayerDraw(room.gameState);
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  /**
-   * Départage sans attendre les joueurs manquants. Réservée à l'organisateur,
-   * cette sortie de secours évite qu'un joueur parti chercher un verre bloque
-   * indéfiniment le lancement de la partie.
-   */
-  socket.on('end-first-player-roll', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-    if (room.gameState.phase !== 'first_player_roll') return;
-
-    if (!settleFirstPlayerDraw(room.gameState, { force: true })) {
-      return socket.emit('error-msg', 'Il faut au moins un lancer pour désigner le premier joueur.');
-    }
-
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  // Helper to check if a socket is authorized to take action for the active player
-  function isPlayerAllowedToAct(room: any, socketId: string): boolean {
-    const activePlayer = room.gameState.players[room.gameState.activePlayerIndex];
-    if (!activePlayer) return false;
-
-    // Direct online player turn
-    if (activePlayer.id === socketId) return true;
-
-    // Local pass-and-play player, room host, or single-player room host
-    if (room.hostSocketId === socketId) {
-      if (room.settings.isLocalMode || activePlayer.id.startsWith('local_') || room.gameState.players.length === 1) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  function isPlayerAllowedToAnswer(room: Room, socketId: string): boolean {
-    if (isPlayerAllowedToAct(room, socketId)) return true;
-    if (!isCardReadAloud(room.settings)) return false;
-
-    return resolveReaderId(room.gameState.players, room.gameState.activePlayerIndex) === socketId;
-  }
-
-  /**
-   * Bascule la pause. Réservée à l'organisateur.
-   *
-   * À la reprise, `questionStartTime` est décalé de la durée de la pause : le
-   * minuteur repart là où il s'était arrêté au lieu d'avoir expiré entre-temps.
-   */
-  socket.on('toggle-pause', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.hostSocketId !== socket.id) return;
-    if (room.gameState.phase === 'lobby' || room.gameState.phase === 'game_over') return;
-
-    const wasPaused = room.gameState.isPaused === true;
-    togglePauseState(room.gameState, Date.now());
-    console.log(`[Room] Partie ${wasPaused ? 'reprise' : 'mise en pause'}: ${room.code}`);
-
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  /** Pendant la pause, aucune action de jeu n'est acceptée. */
-  function isPaused(room: Room): boolean {
-    return room.gameState.isPaused === true;
-  }
-
-  // Roll Dice
-  socket.on('roll-dice', (data: {
-    roomCode: string;
-    power?: number | null;
-    /** Angle du geste, en degrés : il donne la direction du dé sur le plateau. */
-    angle?: number | null;
-  }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase !== 'rolling') return;
-    if (isPaused(room)) return;
-
-    if (!isPlayerAllowedToAct(room, socket.id)) {
-      console.warn(`[Roll Rejected] Socket ${socket.id} is not active player ${room.gameState.players[room.gameState.activePlayerIndex]?.id}`);
-      return;
-    }
-
-    // Le serveur tire la face, et lui seul : le client n'envoie qu'un geste,
-    // jamais une face. Le geste ne pèse pas sur le résultat — il dessine le vol,
-    // juste en dessous.
-    const dice = rollDie();
-    room.gameState.diceValue = dice;
-
-    // Le parcours du dé sur le plateau se déduit de la poussée et d'une graine
-    // tirée ici : tous les écrans rejouent alors le même vol. Les deux nombres
-    // qui viennent du réseau sont bornés — l'angle tourne, la puissance non.
-    const power = typeof data?.power === 'number' && Number.isFinite(data.power)
-      ? Math.max(0, Math.min(100, data.power))
-      : 0;
-    const angle = typeof data?.angle === 'number' && Number.isFinite(data.angle)
-      ? ((data.angle % 360) + 360) % 360
-      : DEFAULT_THROW_ANGLE;
-    room.gameState.diceThrow = {
-      power,
-      angle,
-      seed: Math.floor(Math.random() * 0x7fffffff) + 1,
-    };
-    room.gameState.phase = 'moving';
-    room.gameState.lastTurnEventMessage = null;
-    room.gameState.bonusAwardedThisTurn = null;
-    room.gameState.surpriseSpinThisTurn = false;
-    room.gameState.surpriseWheel = null;
-    room.gameState.activeQuestionBonus = null;
-    room.gameState.bigLeapThisTurn = null;
-
-    const activePlayer = room.gameState.players[room.gameState.activePlayerIndex];
-    const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
-
-    // Calculate possible movement destination tile IDs
-    const currentTile = board.tiles.find(t => t.id === activePlayer.currentTileId) || board.tiles[0];
-    const possibleMoves = calculateMoves(currentTile.id, dice, board);
-
-    // Compute possible destination tiles; movement will be executed via 'move-player'
-    room.gameState.possibleMoves = possibleMoves;
-
-    emitGameState(room);
-  });
-
-  // Move Token to Tile
-  socket.on('move-player', (data: { roomCode: string; destinationTileId: number }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase !== 'moving') return;
-    if (isPaused(room)) return;
-
-    if (!isPlayerAllowedToAct(room, socket.id)) {
-      console.warn(`[Move Rejected] Socket ${socket.id} not allowed to move for player`);
-      return;
-    }
-
-    // Guardrail: Destination tile must be one of the calculated possible moves
-    if (room.gameState.possibleMoves.length > 0 && !room.gameState.possibleMoves.includes(data.destinationTileId)) {
-      console.warn(`[Move Safety] Tile ${data.destinationTileId} not in possibleMoves, redirecting to:`, room.gameState.possibleMoves[0]);
-      data.destinationTileId = room.gameState.possibleMoves[0];
-    }
-
-    const activePlayer = room.gameState.players[room.gameState.activePlayerIndex];
-    activePlayer.currentTileId = data.destinationTileId;
-    room.gameState.selectedTileId = data.destinationTileId;
-
-    const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
-    const tile = board.tiles.find(t => t.id === data.destinationTileId);
-
-    if (!tile) return;
-
-    if (tile.type === 'reroll') {
-      // Re-roll tile: player gets another roll!
-      room.gameState.phase = 'rolling';
-      room.gameState.diceValue = null;
-      // La poussée précédente ne décrit plus rien : sans cet oubli, le dé restait
-      // affiché à son point de chute au milieu du plateau, puis le nouveau lancer
-      // le faisait repartir de son coin — il sautait d'un endroit à l'autre.
-      room.gameState.diceThrow = null;
-      room.gameState.possibleMoves = [];
-      // Le Grand saut décrivait le déplacement qu'on vient d'annuler : la case
-      // Relancer renvoie au lancer, donc le compte de pas ne veut plus rien dire.
-      room.gameState.bigLeapThisTurn = null;
-      room.gameState.lastTurnEventMessage = `🎲 ${activePlayer.name} a atterri sur une case Relancer le dé ! Rejouez tout de suite.`;
-      emitGameState(room);
-      return;
-    }
-
-    if (tile.type === 'surprise') {
-      awardSurpriseBonus(room.gameState);
-      // Le résultat (bonus ou case vide) est révélé par la roue côté client ; le
-      // journal reste volontairement muet pour ne pas divulgâcher le tirage.
-      if (room.gameState.surpriseSpinThisTurn) {
-        room.gameState.lastTurnEventMessage = `🎡 Boîte surprise : ${activePlayer.name} fait tourner la roue !`;
-      }
-    }
-
-    // Pick question according to tile category or player's difficulty
-    const validCategories = room.settings.selectedCategories && room.settings.selectedCategories.length > 0 
-      ? room.settings.selectedCategories 
-      : ['histoire', 'geographie', 'cinema', 'sciences', 'art', 'sports', 'popculture', 'gastronomie'];
-
-    const categoryId = tile.categoryId || validCategories[Math.floor(Math.random() * validCategories.length)];
-    const question = pickQuestionForPlayer(room.gameState, categoryId as CategoryId, activePlayer.difficulty);
-
-    room.gameState.currentQuestion = question;
-    // Le rappel de la carte précédente s'effface ici, et pas au changement de
-    // tour : c'est précisément l'intervalle pendant lequel la table doit pouvoir
-    // finir de lire le « Le saviez-vous ? ».
-    room.gameState.lastQuestionRecap = null;
-    room.gameState.phase = 'question';
-    // Sur une case Surprise, le minuteur ne démarre pas tout de suite : la roue
-    // doit d'abord tourner. On laisse `questionStartTime` en attente (null) et
-    // c'est le joueur actif qui lance le décompte en fermant la roue, via
-    // « start-question-timer ». Sinon le temps défilait pour toute la table
-    // pendant l'animation de la roue.
-    room.gameState.questionStartTime = room.gameState.surpriseSpinThisTurn ? null : Date.now();
-
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  // Lancement de la roue surprise. Le client n'envoie qu'un **geste** — un appui,
-  // sans résultat —, comme pour le dé : c'est le serveur qui retient l'instant du
-  // lancer, et le quartier d'arrivée était déjà décidé en arrivant sur la case.
-  // Toute la table voit alors la même roue tourner et s'arrêter au même endroit.
-  socket.on('spin-surprise-wheel', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || isPaused(room)) return;
-    if (room.gameState.phase !== 'question') return;
-    if (!isPlayerAllowedToAct(room, socket.id)) return;
-    if (!room.gameState.surpriseSpinThisTurn) return;
-    const wheel = room.gameState.surpriseWheel;
-    if (wheel?.startedAt != null) return; // déjà lancée
-
-    // Un salon repris du disque peut avoir été enregistré avant que la roue ne
-    // soit décrite dans l'état : sans ce repli, son quartier manquerait et
-    // personne ne pourrait plus la lancer — la table resterait bloquée devant.
-    const slot = wheel?.slot ?? wheelSlotFor(room.gameState.bonusAwardedThisTurn ?? null);
-    room.gameState.surpriseWheel = { slot, startedAt: Date.now() };
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  // Fin de la roue surprise : le joueur actif démarre le minuteur pour toute la
-  // table, une fois la roue arrêtée et le bonus révélé. Idempotent et réservé au
-  // joueur actif — c'est lui qui donne le rythme, les autres écrans referment leur
-  // roue en voyant le minuteur démarrer.
-  socket.on('start-question-timer', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || isPaused(room)) return;
-    if (room.gameState.phase !== 'question') return;
-    if (!isPlayerAllowedToAct(room, socket.id)) return;
-    if (!room.gameState.surpriseSpinThisTurn) return;
-    if (room.gameState.questionStartTime != null) return; // déjà lancé
-
-    room.gameState.questionStartTime = Date.now();
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  // Use a stored question bonus. The server chooses the eliminated answers so
-  // the correct answer never needs to be sent to the answering player's client.
-  socket.on('use-bonus', (data: { roomCode: string; bonusType: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || isPaused(room)) return;
-    if (!BONUS_ROSTER.includes(data.bonusType as BonusType)) return;
-    // `isPlayerAllowedToAct` et non `isPlayerAllowedToAnswer` : le lecteur a le
-    // droit de trancher une réponse à voix haute, mais pas de dépenser un bonus
-    // qui n'est pas le sien. `useBonus` prélève sur le joueur actif, si bien que
-    // le lecteur consommait le 50/50 de la personne qu'il interrogeait — signalé
-    // en partie : « quand c'était à ma femme de jouer, j'avais la possibilité
-    // d'activer son bonus à sa place ». Un bonus est un choix tactique, il
-    // n'appartient qu'à celui dont c'est le tour.
-    if (!isPlayerAllowedToAct(room, socket.id)) return;
-
-    // Le Grand saut est le seul bonus qui agit sur le plateau et non sur la
-    // carte : il lui faut le plateau de la partie, et sa propre phase.
-    if (data.bonusType === BIG_LEAP_BONUS) {
-      const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
-      // Le saut s'annonce dans le sélecteur de destination, qui est déjà à
-      // l'écran de tout le monde en phase `moving` : pas de message de tour, qui
-      // ne s'affiche qu'en phase de lancer et arriverait donc trop tard.
-      if (!useLeapBonus(room.gameState, board)) return;
-    } else if (!useBonus(room.gameState, data.bonusType as BonusType)) {
-      return;
-    }
-
-    emitGameState(room);
-    saveRooms(rooms);
-  });
-
-  // Submit Question Answer
-  socket.on('submit-answer', (data: { roomCode: string; optionIndex: number }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase !== 'question' || !room.gameState.currentQuestion) return;
-    if (isPaused(room)) return;
-    if (!isPlayerAllowedToAnswer(room, socket.id)) return;
-    if (!Number.isInteger(data.optionIndex) || data.optionIndex < -1 || data.optionIndex > 3) return;
-    if (room.gameState.activeQuestionBonus?.hiddenOptionIndexes.includes(data.optionIndex)) return;
-
-    const board = buildBoard(room.settings.boardType, room.gameState.boardCategories);
-    resolveAnswer(room.gameState, room.settings, board, data.optionIndex);
-    emitGameState(room);
-  });
-
-  // Next Turn or Extra Turn
-  socket.on('next-turn', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || room.gameState.phase === 'game_over') return;
-    if (isPaused(room)) return;
-
-    // Guardrail: next-turn CAN ONLY BE EXECUTED when phase is evaluating or question
-    if (room.gameState.phase !== 'evaluating' && room.gameState.phase !== 'question') {
-      console.warn(`[NextTurn Rejected] Cannot trigger next-turn from phase "${room.gameState.phase}"`);
-      return;
-    }
-    if (!isPlayerAllowedToAnswer(room, socket.id)) return;
-
-    advanceTurn(room.gameState);
-    emitGameState(room);
-  });
-
-  // Send Emoji Reaction
-  socket.on('send-emoji', (data: { roomCode: string; emoji: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room) return;
-
-    const player = room.gameState.players.find(p => p.id === socket.id);
-    io.to(data.roomCode).emit('emoji-received', {
-      id: `${Date.now()}_${Math.random()}`,
-      playerId: socket.id,
-      playerName: player?.name || 'Joueur',
-      emoji: data.emoji,
-      timestamp: Date.now()
-    });
-  });
-
-  // WebRTC Signaling for the live reader/answerer duo.
-  //
-  // Two players are on air during a question: the answerer and their reader.
-  // Each of them publishes to every other room member, so the duo see and hear
-  // each other and the remaining players follow along. Only a publisher may
-  // offer, which keeps the handshake free of glare: a connection is therefore
-  // fully identified by its publisher, carried in `publisherId`.
-  const isOnAir = (room: Room, socketId: string) =>
-    room.settings.enableLiveCamera === true
-    && room.gameState.phase === 'question'
-    && resolveOnAirIds(room.gameState.players, room.gameState.activePlayerIndex).includes(socketId);
-
-  socket.on('webrtc-broadcaster-ready', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || !isOnAir(room, socket.id)) return;
-
-    socket.to(data.roomCode).emit('webrtc-broadcaster-ready', {
-      senderPlayerId: socket.id
-    });
-  });
-
-  socket.on('webrtc-viewer-ready', (data: { roomCode: string; targetPlayerId: string }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || !room.sockets.has(socket.id)) return;
-    if (!isOnAir(room, data.targetPlayerId)) return;
-    // A publisher never subscribes to itself, and asking for one's own stream
-    // would make it open a peer connection to its own socket.
-    if (data.targetPlayerId === socket.id) return;
-
-    io.to(data.targetPlayerId).emit('webrtc-viewer-ready', {
-      senderPlayerId: socket.id
-    });
-  });
-
-  socket.on('webrtc-offer', (data: { roomCode: string; targetPlayerId: string; offer: any }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || !isOnAir(room, socket.id)) return;
-    if (!room.sockets.has(data.targetPlayerId)) return;
-
-    io.to(data.targetPlayerId).emit('webrtc-offer', {
-      senderPlayerId: socket.id,
-      offer: data.offer
-    });
-  });
-
-  socket.on('webrtc-answer', (data: { roomCode: string; targetPlayerId: string; answer: any }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || !room.sockets.has(socket.id)) return;
-    if (!isOnAir(room, data.targetPlayerId)) return;
-
-    io.to(data.targetPlayerId).emit('webrtc-answer', {
-      senderPlayerId: socket.id,
-      answer: data.answer
-    });
-  });
-
-  socket.on('webrtc-candidate', (data: {
-    roomCode: string;
-    targetPlayerId: string;
-    publisherId: string;
-    candidate: any;
-  }) => {
-    const room = getRoom(data.roomCode);
-    if (!room || !room.sockets.has(socket.id)) return;
-    if (!room.sockets.has(data.targetPlayerId)) return;
-    // The candidate must belong to a live connection, and both ends must be part
-    // of it: without this, any room member could inject candidates into a
-    // stranger's session.
-    if (!isOnAir(room, data.publisherId)) return;
-    if (data.publisherId !== socket.id && data.publisherId !== data.targetPlayerId) return;
-
-    io.to(data.targetPlayerId).emit('webrtc-candidate', {
-      senderPlayerId: socket.id,
-      publisherId: data.publisherId,
-      candidate: data.candidate
-    });
-  });
-
-  socket.on('webrtc-stop', (data: { roomCode: string }) => {
-    const room = getRoom(data.roomCode);
-    // Any room member may announce that their own stream stopped: a sender can
-    // only ever speak about itself here. Requiring the broadcaster role would
-    // reject the notice sent at the end of a turn, since the phase has already
-    // left `question` by then — which left every viewer holding a dead peer
-    // connection until ICE eventually timed out.
-    if (!room || !room.sockets.has(socket.id)) return;
-
-    socket.to(data.roomCode).emit('webrtc-stopped', {
-      senderPlayerId: socket.id
-    });
-  });
-
-  socket.on('leave-room', (data: { roomCode: string }) => {
-    const code = (data.roomCode || '').toUpperCase().trim();
-    const room = getRoom(code);
-    if (!room || !room.sockets.has(socket.id)) return;
-
-    if (room.hostSocketId === socket.id) {
-      closeRoom(code, 'L’organisateur a fermé le salon.');
-      return;
-    }
-
-    removeSocketFromRoom(room, socket.id);
-    socket.leave(code);
-    socket.emit('room-left');
-    room.emptySince = room.sockets.size === 0 ? Date.now() : null;
-    emitGameState(room);
-  });
-
-  // Disconnect
-  socket.on('disconnect', () => {
-    console.log(`[Socket] Déconnexion: ${socket.id}`);
-    for (const [code, room] of rooms.entries()) {
-      if (room.sockets.has(socket.id)) {
-        room.sockets.delete(socket.id);
-        const p = room.gameState.players.find(pl => pl.id === socket.id);
-        if (p) {
-          p.isConnected = false;
-          // On n'attend plus le lancer d'un absent : si les présents ont tous
-          // lancé, le tirage se tranche tout de suite.
-          settleFirstPlayerDraw(room.gameState);
-        }
-
-        if (room.hostSocketId === socket.id) {
-          room.hostDisconnectedAt = Date.now();
-        }
-        room.emptySince = room.sockets.size === 0 ? Date.now() : null;
-
-        emitGameState(room);
-      }
-    }
-  });
+const { io, emitGameState } = attachGameSocketServer(httpServer, {
+  rooms,
+  persist: () => saveRooms(rooms),
+  publicOrigins: parsePublicOrigins(process.env.PUBLIC_ORIGIN),
 });
+
+// Dernier filet. Les handlers de socket.io attrapent déjà leurs propres
+// exceptions ; ce qui arrive encore ici est un bug ailleurs, et l'état du
+// processus n'est plus sûr. On écrit les parties tant qu'on le peut, puis on
+// s'arrête : Railway relance le service, et le rechargement revalide chaque
+// salon. Avant, le processus mourait sans rien écrire — trois secondes de
+// partie perdues pour toutes les tables.
+process.on('uncaughtException', (error) => {
+  console.error('❌ Exception non rattrapée, sauvegarde puis arrêt :', error);
+  try {
+    saveRoomsSync(rooms);
+  } finally {
+    process.exit(1);
+  }
+});
+// Une promesse rejetée sans gestionnaire ne compromet pas l'état : on la
+// journalise et on continue, au lieu du plantage par défaut de Node.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  Promesse rejetée sans gestionnaire :', reason);
+});
+
 
 // Vite & Static file serving
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  if (isDevelopment) {
+    // Import dynamique : en production, Vite n'est ni chargé ni joignable.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
     });
     app.use(vite.middlewares);
   } else {
+    // `dist/` ne contient plus que le client : le bundle serveur et sa source
+    // map — toute la banque de questions, réponses comprises — sont construits
+    // dans `build/`, hors de ce dossier servi tel quel.
     const distPath = path.join(process.cwd(), 'dist');
     const assetsPath = path.join(distPath, 'assets');
     const contentTypes: Record<string, string> = {
@@ -1556,13 +383,17 @@ async function startServer() {
 
     // Vite filenames are content-hashed. Serve the precompressed variant and
     // cache it for a year; a future deployment gets a new filename.
-    app.get('/assets/*', (req, res, next) => {
+    // Express 5 (path-to-regexp 8) refuse le joker nu `*` : il se nomme.
+    app.get('/assets/{*asset}', (req, res, next) => {
+      // Posé avant tout choix : la réponse dépend du codage accepté, y compris
+      // quand on retombe sur le fichier d'origine. Sans cela, un cache partagé
+      // pouvait resservir du Brotli à un client qui ne le lit pas.
+      res.setHeader('Vary', 'Accept-Encoding');
       const relativeAsset = req.path.slice('/assets/'.length);
       const originalPath = path.resolve(assetsPath, relativeAsset);
       if (!originalPath.startsWith(`${assetsPath}${path.sep}`)) return next();
 
-      const accepted = req.header('accept-encoding') ?? '';
-      const encoding = accepted.includes('br') ? 'br' : accepted.includes('gzip') ? 'gzip' : null;
+      const encoding = negotiateEncoding(req.header('accept-encoding'));
       const compressedPath = encoding === 'br'
         ? `${originalPath}.br`
         : encoding === 'gzip'
@@ -1572,10 +403,7 @@ async function startServer() {
       if (!existsSync(compressedPath)) return next();
       const contentType = contentTypes[path.extname(originalPath)];
       if (contentType) res.setHeader('Content-Type', contentType);
-      if (encoding) {
-        res.setHeader('Content-Encoding', encoding);
-        res.setHeader('Vary', 'Accept-Encoding');
-      }
+      if (encoding) res.setHeader('Content-Encoding', encoding);
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       return res.sendFile(compressedPath);
     });
@@ -1591,14 +419,32 @@ async function startServer() {
       },
     }));
     const indexTemplate = readFileSync(path.join(distPath, 'index.html'), 'utf-8');
-    app.get('*', (req, res) => {
+    // Une route d'API inconnue, ou un fichier absent (`/server.cjs`, une
+    // `.map`…), répond 404 au lieu de la page du jeu : un 200 laissait croire
+    // que le fichier existait, et masquait les liens cassés.
+    app.all('/api/{*route}', (_req, res) => {
+      res.status(404).json({ error: 'Ressource introuvable.' });
+    });
+    app.get('/{*page}', (req, res) => {
+      if (path.extname(req.path)) {
+        res.status(404).type('text/plain; charset=utf-8').send('Fichier introuvable.');
+        return;
+      }
       res.setHeader('Cache-Control', 'no-cache');
       res.type('html').send(withAbsolutePreviewImages(indexTemplate, previewOrigin(req)));
     });
   }
+  app.use(finalErrorHandler);
 
   checkStore();
-  startRoomPersistence(rooms);
+  // Après la sauvegarde des parties, on ferme proprement : socket.io prévient
+  // les joueurs (qui se reconnecteront au nouveau conteneur) et le serveur HTTP
+  // cesse d'accepter des requêtes au lieu d'être coupé au milieu d'une réponse.
+  startRoomPersistence(rooms, undefined, () => new Promise<void>((resolve) => {
+    // `io.close` ferme aussi le serveur HTTP auquel il est attaché.
+    io.close(() => resolve());
+    httpServer.closeIdleConnections?.();
+  }));
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🎮 Serveur Le Défi des Familles en ligne sur http://0.0.0.0:${PORT}`);
@@ -1606,4 +452,10 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((error) => {
+  // Sans ce filet, un échec au démarrage (dist/ absent, port pris…) n'était
+  // qu'un rejet de promesse non géré : selon la version de Node, un processus
+  // qui reste en vie sans rien servir.
+  console.error('❌ Le serveur n’a pas pu démarrer :', error);
+  process.exit(1);
+});

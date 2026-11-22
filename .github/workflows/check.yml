@@ -3,6 +3,11 @@
 # questions et build : cette CI le lance sur chaque poussée et chaque pull request,
 # pour qu'une carte fautive ou un détecteur affaibli ne puisse pas arriver sur main
 # sans que personne ne le voie.
+#
+# Les dépendances s'installent avec bun, depuis `bun.lock` gelé : c'est ce lockfile
+# que Railway déploie. La CI lançait `npm ci` sans `package-lock.json` et échouait
+# en dix secondes sur toutes les branches — et, l'eût-elle trouvé, elle aurait testé
+# d'autres versions que celles de la production. Le code, lui, tourne sous Node.
 name: check
 
 on:
@@ -10,16 +15,30 @@ on:
     branches: ['**']
   pull_request:
 
+# Le jeton n'a besoin que de lire le dépôt : une étape compromise ne doit rien
+# pouvoir pousser.
+permissions:
+  contents: read
+
 jobs:
   check:
+    # Une pull request ouverte depuis une branche du dépôt est déjà vérifiée par
+    # sa poussée : seule celle d'un fork a besoin de son propre passage.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Actions épinglées par empreinte : une étiquette se déplace, un SHA non.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-          cache: npm
-      - run: npm ci
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install --frozen-lockfile
+      # Une dépendance vulnérable bloque, comme une carte fautive : le lockfile de
+      # production en portait treize, dont une critique, sans que rien ne le dise.
+      - run: bun audit
       - run: npm run check
       # Non bloquant : la note de fun est un comparateur, pas un seuil. On
       # l'imprime dans le journal de la CI pour voir l'effet de chaque lot de

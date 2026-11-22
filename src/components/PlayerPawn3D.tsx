@@ -5,7 +5,7 @@ import { CATEGORIES } from '../data/categories';
 import { AVATARS } from '../data/avatars';
 import { resolveTilePath } from '../data/boards';
 import { soundManager } from '../utils/sound';
-import { EASE_OUT_SOFT, EASE_SPRING, PAWN_STEP_MS, shade, tint, withAlpha } from '../utils/motion';
+import { EASE_OUT_SOFT, EASE_SPRING, PAWN_STEP_MS, safeCssColor, shade, tint, withAlpha } from '../utils/motion';
 
 /**
  * Les six parts du porte-camemberts, dans le sens horaire depuis midi.
@@ -185,9 +185,13 @@ export const PlayerPawn3D: React.FC<PlayerPawn3DProps> = ({
   };
 
   // ----------------------------------------------------------------- surfaces
+  // La couleur vient d'un autre joueur, par le réseau : elle n'est interpolée
+  // dans les dégradés ci-dessous qu'une fois réduite à un hexadécimal, sans quoi
+  // elle pouvait refermer le dégradé et y glisser un `url(...)` externe.
+  const pawnColor = safeCssColor(player.color);
   // Empty slots keep a hint of the player's colour: a fully dark holder reads
   // as a hole on the board instead of as that player's token.
-  const emptySlot = shade(player.color, 0.68);
+  const emptySlot = shade(pawnColor, 0.68);
 
   const holderGradient = useMemo(() => {
     const stops = wedgeOrder.map((categoryId, index) => {
@@ -198,8 +202,8 @@ export const PlayerPawn3D: React.FC<PlayerPawn3DProps> = ({
     return `conic-gradient(${stops})`;
   }, [player.wedges, emptySlot, wedgeOrder]);
 
-  const rimLight = tint(player.color, 0.4);
-  const rimDark = shade(player.color, 0.45);
+  const rimLight = tint(pawnColor, 0.4);
+  const rimDark = shade(pawnColor, 0.45);
 
   // Hops are described as "up on odd frames, down on even frames", so a 4-tile
   // move produces four arcs that always land flat on the destination.
@@ -267,7 +271,7 @@ export const PlayerPawn3D: React.FC<PlayerPawn3DProps> = ({
             height: size * 0.3,
             left: size * 0.05,
             top: groundY - size * 0.15,
-            borderColor: withAlpha(player.color, 0.9)
+            borderColor: withAlpha(pawnColor, 0.9)
           }}
           initial={{ scale: 0.5, opacity: 0.95 }}
           animate={{ scale: 2.1, opacity: 0 }}
@@ -342,7 +346,7 @@ export const PlayerPawn3D: React.FC<PlayerPawn3DProps> = ({
             <div
               className="absolute inset-0 overflow-hidden rounded-full"
               style={{
-                background: `linear-gradient(150deg, ${rimLight} 0%, ${player.color} 45%, ${rimDark} 100%)`,
+                background: `linear-gradient(150deg, ${rimLight} 0%, ${pawnColor} 45%, ${rimDark} 100%)`,
                 padding: Math.max(2, discD * 0.09),
                 boxShadow: `0 ${discD * 0.06}px ${discD * 0.18}px rgba(2, 6, 23, 0.65), inset 0 0 ${discD * 0.1}px rgba(255,255,255,0.35)`
               }}
@@ -366,7 +370,7 @@ export const PlayerPawn3D: React.FC<PlayerPawn3DProps> = ({
                     height: '46%',
                     left: '27%',
                     top: '27%',
-                    background: `radial-gradient(circle at 32% 28%, ${tint(player.color, 0.55)}, ${player.color} 62%, ${rimDark})`,
+                    background: `radial-gradient(circle at 32% 28%, ${tint(pawnColor, 0.55)}, ${pawnColor} 62%, ${rimDark})`,
                     border: `${Math.max(1, discD * 0.028)}px solid rgba(255,255,255,0.92)`,
                     boxShadow: `0 ${discD * 0.03}px ${discD * 0.08}px rgba(2,6,23,0.55)`,
                     fontSize: discD * 0.24,

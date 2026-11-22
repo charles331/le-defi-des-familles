@@ -15,7 +15,12 @@ export interface PublicGameState extends Omit<
   customPacks?: Array<{ name: string; questionCount: number }>;
 }
 
-function isDesignatedReader(state: GameState, socketId: string, hostSocketId: string): boolean {
+/**
+ * Le lecteur désigné : celui qui reçoit la solution, et donc le seul qui puisse
+ * juger une carte ouverte (`answerRules.ts`). En pass & play, c'est l'appareil
+ * de l'organisateur.
+ */
+export function isDesignatedReader(state: GameState, socketId: string, hostSocketId: string): boolean {
   if (!isCardReadAloud(state.settings) || state.players.length === 0) return false;
   if (state.settings.isLocalMode) return socketId === hostSocketId;
 
