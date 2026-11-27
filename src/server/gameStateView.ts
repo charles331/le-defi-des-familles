@@ -9,7 +9,7 @@ export interface PublicQuestion extends Omit<Question, 'correctAnswerIndex' | 'e
 
 export interface PublicGameState extends Omit<
   GameState,
-  'currentQuestion' | 'questionsPool' | 'usedQuestionIds' | 'customPacks'
+  'currentQuestion' | 'questionsPool' | 'usedQuestionIds' | 'seenQuestionIds' | 'customPacks'
 > {
   currentQuestion: PublicQuestion | null;
   customPacks?: Array<{ name: string; questionCount: number }>;
@@ -41,6 +41,7 @@ export function createGameStateView(
   const {
     questionsPool: _questionsPool,
     usedQuestionIds: _usedQuestionIds,
+    seenQuestionIds: _seenQuestionIds,
     customPacks,
     currentQuestion,
     ...publicState

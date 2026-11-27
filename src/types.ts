@@ -228,6 +228,11 @@ export interface GameState {
   firstPlayerDraw?: FirstPlayerDraw | null;
   questionsPool: Question[];
   usedQuestionIds: string[];
+  /**
+   * Cartes vues par les appareils de la table lors de parties précédentes, à
+   * servir en dernier (`src/server/seenQuestions.ts`). Réservé au serveur.
+   */
+  seenQuestionIds?: string[];
   customPacks?: { name: string; questions: Question[] }[];
   lastTurnEventMessage?: string | null;
   /** Bonus gagné en arrivant sur la case de ce tour, affiché avec la question. */
