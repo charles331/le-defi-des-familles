@@ -20,6 +20,9 @@ export const VictoryModal: React.FC<VictoryModalProps> = ({
   isHost = false
 }) => {
   const winner = gameState.players.find(p => p.id === gameState.winnerId) || gameState.players[0];
+  // L'objectif se règle de 1 à 6 camemberts au salon : l'écran affichait « /6 »
+  // en dur, si bien qu'une partie gagnée à 4 se concluait sur « 4/6 ».
+  const wedgesToWin = gameState.settings.wedgesToWin || 6;
   const avatar = AVATARS.find(a => a.id === winner.avatarId) || AVATARS[0];
 
   useEffect(() => {
@@ -65,9 +68,9 @@ export const VictoryModal: React.FC<VictoryModalProps> = ({
           <div className="text-xs font-black uppercase tracking-widest text-amber-400 mb-1 flex items-center justify-center gap-1.5">
             <Sparkles className="w-4 h-4" /> GRAND CHAMPION DU SALON <Sparkles className="w-4 h-4" />
           </div>
-          <h2 className="text-3xl font-black text-white">{winner.name} a Gagné ! 🎉</h2>
+          <h2 className="text-3xl font-black text-white">{winner.name} a gagné ! 🎉</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Félicitations ! Tous les camemberts récoltés et l&apos;épreuve centrale réussie avec succès.
+            Félicitations ! {wedgesToWin === 1 ? 'Le camembert récolté' : `Les ${wedgesToWin} camemberts récoltés`} et l&apos;épreuve centrale réussie.
           </p>
         </div>
 
@@ -96,7 +99,7 @@ export const VictoryModal: React.FC<VictoryModalProps> = ({
                   </div>
 
                   <div className="text-xs font-mono font-semibold">
-                    {p.wedges.length}/6 Camemberts ({p.score} pts)
+                    {p.wedges.length}/{wedgesToWin} {wedgesToWin === 1 ? 'camembert' : 'camemberts'} ({p.score} pts)
                   </div>
                 </div>
               );
