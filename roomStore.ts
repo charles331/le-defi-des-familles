@@ -366,6 +366,11 @@ export function reviveStoredRoom(
       usedQuestionIds: Array.isArray(storedState.usedQuestionIds)
         ? storedState.usedQuestionIds.filter((id): id is string => typeof id === 'string')
         : [],
+      seenQuestionIds: Array.isArray(storedState.seenQuestionIds)
+        ? storedState.seenQuestionIds
+          .filter((id): id is string => typeof id === 'string' && id.length <= 80)
+          .slice(0, questionsDatabase.length + MAX_STORED_PACKS * 100)
+        : [],
       boardCategories: Array.isArray(storedState.boardCategories)
         ? storedState.boardCategories.filter(isKnownCategory)
         : undefined,

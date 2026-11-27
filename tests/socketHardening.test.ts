@@ -667,3 +667,17 @@ test('le joueur actif qui quitte le salon ne laisse pas sa carte, solution compr
   assert.equal(state.currentQuestion, null);
   assert.equal(room.gameState.players.length, 1);
 });
+
+test('les cartes vues ne se partagent qu’entre membres, une fois par connexion', async () => {
+  const { host, guest, roomCode, room } = await tableOfTwo();
+  const [first, second, third] = room.gameState.questionsPool.map(question => question.id);
+
+  const outsider = await client();
+  outsider.emit('share-seen-questions', { roomCode, questionIds: [first] });
+  guest.emit('share-seen-questions', { roomCode, questionIds: [second, 'inconnue'] });
+  guest.emit('share-seen-questions', { roomCode, questionIds: [third] });
+  host.emit('share-seen-questions', { roomCode, questionIds: 'pas une liste' });
+  await new Promise(resolve => setTimeout(resolve, 200));
+
+  assert.deepEqual(room.gameState.seenQuestionIds, [second]);
+});

@@ -247,7 +247,8 @@ test('a new round wipes wedges, pawns, scores and bonuses', () => {
   assert.equal(state.winnerId, null);
   assert.equal(state.currentQuestion, null);
   assert.equal(state.activePlayerIndex, 0);
-  assert.deepEqual(state.usedQuestionIds, []);
+  // Les cartes déjà posées restent en mémoire : « Rejouer » ne les ressert pas.
+  assert.deepEqual(state.usedQuestionIds, ['q0']);
   assert.equal(state.firstPlayerDraw, null);
   // La phase reste à l'appelant : revenir au salon et relancer ne visent pas la
   // même destination.

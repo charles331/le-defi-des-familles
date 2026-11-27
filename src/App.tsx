@@ -17,6 +17,7 @@ import { LiveChat } from './components/LiveChat';
 import { LiveCameraStatusBar } from './components/LiveSpotlight';
 import { LastQuestionRecap } from './components/LastQuestionRecap';
 import { cardReaderId, isCardReadAloud } from './server/turnRoles';
+import { loadSeenQuestionIds, recordSeenQuestion } from './utils/seenQuestions';
 import { questionRevealDelayMs, usePrefersReducedMotion } from './utils/motion';
 
 const VictoryModal = React.lazy(() =>
@@ -66,6 +67,13 @@ export default function App() {
       setShowQuestionModal(false);
     }
   }, [gameState?.phase, gameState?.currentQuestion?.id, gameState?.diceValue, reducedMotion]);
+
+  // Une carte affichée sur cet écran est une carte vue : l'appareil s'en souvient
+  // pour les parties suivantes (`utils/seenQuestions.ts`).
+  const shownQuestionId = showQuestionModal ? gameState?.currentQuestion?.id : undefined;
+  useEffect(() => {
+    if (shownQuestionId) recordSeenQuestion(shownQuestionId);
+  }, [shownQuestionId]);
 
   // Le tirage bascule en « rolling » dès qu'il est tranché : on garde l'écran du
   // tirage quelques secondes de plus pour annoncer le vainqueur, sauf si la page
@@ -130,12 +138,20 @@ export default function App() {
       }
     });
 
+    // Les cartes vues lors des parties précédentes sur cet appareil : le salon
+    // sert d'abord celles que personne autour de la table n'a encore vues.
+    const shareSeenQuestions = (roomCode: string) => {
+      const questionIds = loadSeenQuestionIds();
+      if (questionIds.length > 0) newSocket.emit('share-seen-questions', { roomCode, questionIds });
+    };
+
     newSocket.on('room-created', (data: { roomCode: string; player: Player; gameState: GameState; generationToken?: string; sessionToken?: string }) => {
       setGameState(data.gameState);
       setGenerationToken(data.generationToken ?? '');
       if (data.player?.id) setCurrentUserId(data.player.id);
       setErrorMessage(null);
       persistSession(data.roomCode, data.player.id, data.sessionToken);
+      shareSeenQuestions(data.roomCode);
     });
 
     newSocket.on('room-joined', (data: { roomCode: string; player: Player; gameState: GameState; generationToken?: string; sessionToken?: string }) => {
@@ -145,6 +161,7 @@ export default function App() {
       if (data.player?.id) setCurrentUserId(data.player.id);
       setErrorMessage(null);
       persistSession(data.roomCode, data.player.id, data.sessionToken);
+      shareSeenQuestions(data.roomCode);
     });
 
     newSocket.on('game-state-update', (updatedState: GameState) => {

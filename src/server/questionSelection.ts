@@ -10,6 +10,7 @@
  */
 
 import { normalizeCategoryId } from '../data/categories';
+import { preferUnseen } from './seenQuestions';
 import { resolveReaderId } from './turnRoles';
 import { CategoryId, DifficultyLevel, GameSettings, GameState, Question } from '../types';
 
@@ -127,6 +128,9 @@ export function pickQuestionForPlayer(
   const targetCategory = normalizeCategoryId(targetCategoryId);
   const activeThemes = activeThemeKeys(state.settings);
   const usedIds = new Set(state.usedQuestionIds);
+  // Cartes vues par les appareils de la table lors de parties précédentes
+  // (`seenQuestions.ts`) : servies en dernier, jamais refusées.
+  const seenIds = new Set(state.seenQuestionIds ?? []);
   const pickOne = (list: Question[]): Question => list[Math.floor(random() * list.length)];
 
   // Les questions ouvertes n'apparaissent qu'en mode lecteur : hors de ce mode,
@@ -197,7 +201,7 @@ export function pickQuestionForPlayer(
           && (activeThemes.size === 0 || !belongsToActiveTheme(question, activeThemes)),
       );
       const fresh = candidates.filter((question) => !usedIds.has(question.id));
-      const chosen = fresh.length > 0 ? fresh : candidates;
+      const chosen = fresh.length > 0 ? preferUnseen(fresh, seenIds) : candidates;
       if (chosen.length > 0) {
         return serve(pickOne(chosen), targetCategory);
       }
@@ -247,7 +251,7 @@ export function pickQuestionForPlayer(
     }
   }
 
-  const selected = pickOne(candidates);
+  const selected = pickOne(preferUnseen(candidates, seenIds));
 
   return serve(
     selected,

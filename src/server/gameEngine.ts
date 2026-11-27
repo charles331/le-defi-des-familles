@@ -138,7 +138,9 @@ export function resetGameForNewRound(state: GameState): void {
   state.lastAnswerResult = null;
   state.winnerId = null;
   state.lastTurnEventMessage = null;
-  state.usedQuestionIds = [];
+  // Les cartes déjà posées ne sont pas oubliées : « Rejouer » resservait les
+  // mêmes questions dans la manche suivante. Le tirage recycle de lui-même un
+  // niveau épuisé (`questionSelection.ts`).
   state.bonusAwardedThisTurn = null;
   state.surpriseSpinThisTurn = false;
   state.surpriseWheel = null;

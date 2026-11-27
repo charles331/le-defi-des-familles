@@ -42,6 +42,7 @@ import { generateRoomCode, normalizeRoomCode } from './roomCodes';
 import { FailureWindow, TokenBucket, clientAddress, isAllowedOrigin, safeTokenEquals } from './socketGuards';
 import { REACTION_MIN_INTERVAL_MS, isReactionEmoji } from '../config/reactions';
 import { cardReaderId, isCardReadAloud, READER_RECONNECT_GRACE_MS, resolveOnAirIds, resolveReaderId } from './turnRoles';
+import { rememberSeenQuestions } from './seenQuestions';
 import { ABSENT_TURN_GRACE_MS, handOverAbsentReader, skipAbsentActivePlayer } from './absentPlayers';
 import { pickQuestionForPlayer } from './questionSelection';
 import {
@@ -1687,6 +1688,17 @@ export function attachGameSocketServer(
       socket.to(room.code).emit('webrtc-stopped', {
         senderPlayerId: socket.id
       });
+    });
+
+    // Les cartes que cet appareil a vues lors de parties précédentes. Une seule
+    // fois par connexion : le message pèse jusqu'à une trentaine de kilo-octets,
+    // et le renvoyer en boucle ne servirait qu'à charger le serveur.
+    let sharedSeenQuestions = false;
+    on('share-seen-questions', (data: { roomCode: string; questionIds?: unknown }) => {
+      const room = getRoom(data.roomCode, socket.id);
+      if (!room || !room.sockets.has(socket.id) || sharedSeenQuestions) return;
+      sharedSeenQuestions = true;
+      if (rememberSeenQuestions(room.gameState, data.questionIds) > 0) persist();
     });
 
     on('leave-room', (data: { roomCode: string }) => {
